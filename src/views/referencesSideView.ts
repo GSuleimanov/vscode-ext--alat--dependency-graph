@@ -149,7 +149,14 @@ export class ReferencesSideView implements vscode.WebviewViewProvider {
   }
 
   private async buildData(): Promise<ViewData> {
-    const { rawLocations, typeDefLocations, defLocations, implLocations, originUri, originPosition, symbolName } = this.input!;
+    const input = this.input!;
+    const seenKeys = new Set<string>();
+    const dedupedRaw = input.rawLocations.filter(l => {
+      const k = `${l.uri.fsPath}:${l.range.start.line}`;
+      return seenKeys.has(k) ? false : (seenKeys.add(k), true);
+    });
+    const { typeDefLocations, defLocations, implLocations, originUri, originPosition, symbolName } = input;
+    const rawLocations = dedupedRaw;
     const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
 
     let importCount = 0;
