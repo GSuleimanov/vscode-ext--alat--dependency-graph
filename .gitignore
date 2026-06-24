@@ -4,6 +4,12 @@ node_modules/
 # Build output
 dist/
 out/
+out-e2e/
+.vscode-test/
+
+# Java/Maven build output (e.g. test fixtures)
+target/
+**/target/
 
 # OMC runtime state (oh-my-claudecode session/agent data)
 .omc/

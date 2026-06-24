@@ -6,13 +6,13 @@ export class FilterStatusBar {
 
   constructor(context: vscode.ExtensionContext) {
     this.item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
-    this.item.command = 'javaNavigator.toggleTestFilter';
+    this.item.command = 'codenav.toggleTestFilter';
 
     context.subscriptions.push(
       this.item,
       vscode.window.onDidChangeActiveTextEditor(() => this.update()),
       vscode.workspace.onDidChangeConfiguration(e => {
-        if (e.affectsConfiguration('javaNavigator.filterTests')) {
+        if (e.affectsConfiguration('codenav.filterTests')) {
           this.update();
         }
       })

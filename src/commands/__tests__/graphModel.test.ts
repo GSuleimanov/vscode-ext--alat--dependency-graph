@@ -1,6 +1,8 @@
-import { test } from 'node:test';
+import { test, before } from 'node:test';
 import assert from 'node:assert';
-import { parseJavaSource, buildGraph, ParsedClass } from '../graphModel';
+import { parseJavaSource, buildGraph, ParsedType, javaProvider } from '../../graph';
+
+before(async () => { await javaProvider.init(); });
 
 function parse(src: string, uri = 'file:///T.java') {
   return parseJavaSource(src, uri);
@@ -142,7 +144,7 @@ test('records declaration kind (class/interface/enum)', () => {
 });
 
 test('buildGraph dedupes nodes by FQN', () => {
-  const parsed: ParsedClass[] = [
+  const parsed: ParsedType[] = [
     { name: 'A', package: 'p', uri: 'u1', line: 0, kind: 'class', extendsNames: [], implementsNames: [], fieldTypes: [] },
     { name: 'A', package: 'p', uri: 'u1', line: 0, kind: 'class', extendsNames: [], implementsNames: [], fieldTypes: [] },
   ];

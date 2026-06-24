@@ -4,12 +4,12 @@ Feature: Project Graph View
   So that I can understand project structure and navigate efficiently
 
   Background:
-    Given the Java Navigator extension is active
+    Given the Codenav extension is active
     And a Java project is open and indexed by the Java Language Server
 
   Scenario: Open graph view from command palette
     Given any Java file is open in the editor
-    When I invoke "Java Navigator: Open Project Graph"
+    When I invoke "Codenav: Open Project Graph"
     Then a new editor panel opens showing the project graph
     And the graph displays packages as clusters and classes as nodes
 
@@ -34,13 +34,6 @@ Feature: Project Graph View
     When I double-click on a class node "OrderService"
     Then the editor opens the corresponding Java file
     And the cursor is placed at the class declaration
-
-  Scenario: Focus graph on current file
-    Given the project graph is open
-    And I am editing "OrderService.java"
-    When I invoke "Java Navigator: Focus Graph on Current File"
-    Then the graph centers on the "OrderService" node
-    And directly connected nodes are highlighted
 
   Scenario: Filter graph by package
     Given the project graph is open and shows the full project

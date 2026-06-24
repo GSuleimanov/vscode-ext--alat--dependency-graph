@@ -2,7 +2,7 @@ import { Given, When, Then } from '@cucumber/cucumber';
 
 // ── Background ────────────────────────────────────────────────────────────────
 
-Given('the Java Navigator extension is active', function () {
+Given('the Codenav extension is active', function () {
   return 'pending';
 });
 

@@ -23,7 +23,7 @@ This is a VSCode extension (`src/extension.ts` is the entry point) that enhances
 
 ### Core data flow
 
-1. **Command trigger** (`src/commands/filteredPeek.ts`) — `Shift+Alt+F12` on a Java symbol fires `javaNavigator.peekFiltered`. It calls four VSCode LSP providers in parallel (references, type definitions, definitions, implementations), then runs `expandViaTypeDefinitions` to widen the result set.
+1. **Command trigger** (`src/commands/filteredPeek.ts`) — `Shift+Alt+F12` on a Java symbol fires `codenav.findReferences`. It calls four VSCode LSP providers in parallel (references, type definitions, definitions, implementations), then runs `expandViaTypeDefinitions` to widen the result set.
 
 2. **Type expansion** (`src/commands/expandViaType.ts`) — Pure logic (no VSCode imports) with an injected `TypeExpansionExecutor`. Given a symbol's type definition location, it:
    - Fetches cross-file locations that reference the type (field declarations in other classes)

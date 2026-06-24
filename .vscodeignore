@@ -3,6 +3,10 @@
 features/**
 src/**
 node_modules/**
+!node_modules/web-tree-sitter/**
+!node_modules/tree-sitter-wasms/out/tree-sitter-java.wasm
+!node_modules/tree-sitter-wasms/out/tree-sitter-python.wasm
+!node_modules/tree-sitter-wasms/package.json
 .gitignore
 esbuild.js
 tsconfig.json
@@ -10,4 +14,13 @@ cucumber.js
 cucumber-report.html
 **/*.map
 **/*.ts
+.omc/**
+.claude/**
+out-e2e/**
+test/**
+test-fixtures/**
+tsconfig.e2e.json
+CLAUDE.md
+PLAN.md
+*.vsix
 !dist/**

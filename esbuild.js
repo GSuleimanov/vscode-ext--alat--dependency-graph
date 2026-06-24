@@ -6,7 +6,9 @@ const buildOptions = {
   entryPoints: ['src/extension.ts'],
   bundle: true,
   outfile: 'dist/extension.js',
-  external: ['vscode'],
+  // web-tree-sitter is an emscripten module that loads its own .wasm at runtime;
+  // keep it external and ship it (+ the grammar wasms) via .vscodeignore.
+  external: ['vscode', 'web-tree-sitter'],
   format: 'cjs',
   platform: 'node',
   target: 'node16',

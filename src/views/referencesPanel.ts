@@ -44,7 +44,7 @@ interface PanelData {
 // ── Panel class ───────────────────────────────────────────────────────────────
 
 const CONFIG: Record<string, string> = {
-  filterImports: 'javaNavigator.filterImports',
+  filterImports: 'codenav.filterImports',
 };
 
 export class ReferencesPanel {
@@ -73,7 +73,7 @@ export class ReferencesPanel {
     // Sync when config changes externally (e.g. status bar toggle or settings UI)
     context.subscriptions.push(
       vscode.workspace.onDidChangeConfiguration(async e => {
-        if (!e.affectsConfiguration('javaNavigator')) { return; }
+        if (!e.affectsConfiguration('codenav')) { return; }
         const i = getConfig().get<boolean>('filterImports') ?? true;
         if (i !== this.filterImports) {
           this.filterImports = i;
@@ -98,7 +98,7 @@ export class ReferencesPanel {
       return;
     }
     const panel = vscode.window.createWebviewPanel(
-      'javaNavigatorReferences',
+      'codenavReferences',
       `References: ${input.symbolName}`,
       { viewColumn: vscode.ViewColumn.Beside, preserveFocus: false },
       { enableScripts: true, retainContextWhenHidden: true }

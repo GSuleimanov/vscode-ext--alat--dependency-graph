@@ -1,7 +1,27 @@
 import * as vscode from 'vscode';
 
 export function getConfig() {
-  return vscode.workspace.getConfiguration('javaNavigator');
+  return vscode.workspace.getConfiguration('codenav');
+}
+
+// Java reserved words plus contextual keywords (var, record, sealed, yield, …). Peeking
+// one of these is never a meaningful navigation — there is no symbol to find — and the
+// LSP may resolve `this`/`super`/`new` to a whole type, triggering a huge search. We
+// short-circuit before any provider call.
+const JAVA_KEYWORDS = new Set<string>([
+  'abstract', 'assert', 'boolean', 'break', 'byte', 'case', 'catch', 'char', 'class',
+  'const', 'continue', 'default', 'do', 'double', 'else', 'enum', 'extends', 'final',
+  'finally', 'float', 'for', 'goto', 'if', 'implements', 'import', 'instanceof', 'int',
+  'interface', 'long', 'native', 'new', 'package', 'private', 'protected', 'public',
+  'return', 'short', 'static', 'strictfp', 'super', 'switch', 'synchronized', 'this',
+  'throw', 'throws', 'transient', 'try', 'void', 'volatile', 'while',
+  // contextual / restricted keywords and literals
+  'var', 'yield', 'record', 'sealed', 'permits', 'non-sealed', 'true', 'false', 'null',
+]);
+
+/** True when the word is a Java keyword/modifier/literal — not a navigable symbol. */
+export function isJavaKeyword(word: string): boolean {
+  return JAVA_KEYWORDS.has(word);
 }
 
 export function isTestLocation(loc: vscode.Location): boolean {
