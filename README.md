@@ -1,10 +1,8 @@
 # Codenav
 
-Enhanced navigation and visualization for Java projects in VSCode.
+Enhanced navigation and visualization for Java projects in VSCode. Especially with a Spring Projects.
 
-Codenav builds on top of the Java language server to give you **cleaner, smarter reference navigation** and a **project relationship graph** — cutting through the noise of import statements, test boilerplate, and third-party library results.
-
-![Codenav](images/codenav-logo.png)
+Codenav builds on top of the Java language server to give you **cleaner, smarter reference navigation** and a **project relationship graph** — cutting through the noise of import statements, tests, definitions and etc.
 
 ## Features
 
@@ -12,14 +10,14 @@ Codenav builds on top of the Java language server to give you **cleaner, smarter
 
 Press **`Shift+Alt+F12`** on any Java symbol to open the **Codenav References** panel. Unlike the built-in "Find All References", Codenav:
 
-- **Expands via type definitions** — calling on an instance variable (e.g. `profileRepository`) surfaces the same cross-file usages as calling on the type name (`ProfileRepository`).
+- **Expands via type definitions** — you get consistent experience when browsing the codebase.
 - **Groups results** into Type Definitions → Definitions → Implementations → References → Tests.
 - **Filters out the noise** — import statements and test-source results are hidden by default (configurable).
 - **Keyboard-first preview** — arrow through results to preview each location inline.
 
 ### 🕸️ Project graph view
 
-Run **`Codenav: Open Project Graph`** from the command palette to open the **Codenav Project Graph** panel and visualize relationships across your project — types, fields, inheritance, and framework roles (Spring, Jakarta, Lombok, Pydantic, and more).
+Run **`Codenav: Open Project Graph`** from the command palette to open the **Codenav Project Graph** panel and visualize relationships across your project — types, fields, inheritance, and framework roles (Spring, Jakarta, Lombok and more).
 
 ## Usage
 
@@ -29,6 +27,9 @@ Run **`Codenav: Open Project Graph`** from the command palette to open the **Cod
 | Open Project Graph | Command Palette → `Codenav: Open Project Graph` |
 
 The References and Project Graph panels appear in the VSCode bottom panel area.
+For better experience put it on Secondary panel.
+I preffer `Shift+CMD+Enter` for a fluent experience: (`CMD+Enter` - go to definition with fallback to references), and adding `Shift` to that - you get better usage map.
+Once Codenav References is focused, you can scroll through the references using arrows. Enter will jump the cursor to the file, Esc will return to the place from where you invoked Codenav References.
 
 ## Configuration
 
