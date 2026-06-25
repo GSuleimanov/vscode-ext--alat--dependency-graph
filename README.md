@@ -15,9 +15,31 @@ Press **`Shift+Alt+F12`** on any Java symbol to open the **Codenav References** 
 - **Filters out the noise** — import statements and test-source results are hidden by default (configurable).
 - **Keyboard-first preview** — arrow through results to preview each location inline.
 
-### 🕸️ Project graph view
+### 🕸️ Focused class graph
 
-Run **`Codenav: Open Project Graph`** from the command palette to open the **Codenav Project Graph** panel and visualize relationships across your project — types, fields, inheritance, and framework roles (Spring, Jakarta, Lombok and more).
+Run **`Codenav: Open Project Graph`** from the command palette to open the graph panel. The graph builds around whichever class is currently open:
+
+```
+  [ CallerA ]     [ CallerB ]        ← classes that inject this class as a field
+         ↓               ↓
+  [ SiblingImpl ]  [ ActiveClass ]  [ OtherSiblingImpl ]   ← siblings share same parent
+                         ↓
+  [ FieldDepA ]  [ FieldDepB ]  [ ParentClass ]            ← what this class uses
+```
+
+The graph updates automatically as you navigate between files. It renders in stages for instant feedback — the active class and its field dependencies appear in milliseconds (tree-sitter), callers and siblings fill in as the language server responds.
+
+#### How the hybrid engine works
+
+The graph uses two data sources chosen for what each does best:
+
+| Data | Source | Why |
+|---|---|---|
+| Active class + field types | **tree-sitter** (static parse) | Single-file parse takes ~5 ms; no LSP round-trip needed |
+| Callers (who uses this class) | **LSP** `executeReferenceProvider` | Project-wide index already maintained by the language server; correct across all files without scanning anything |
+| Siblings (other subclasses of the parent) | **LSP** `executeImplementationProvider` | Same reason — language server knows the full type hierarchy |
+
+This means the graph never scans the whole workspace on load. It reads exactly one file synchronously (tree-sitter), then asks the already-running language server for the rest. On a large project the difference is seconds vs milliseconds for the initial render.
 
 ## Usage
 
