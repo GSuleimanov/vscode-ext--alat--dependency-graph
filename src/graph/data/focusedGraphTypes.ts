@@ -1,6 +1,6 @@
 // Pure types for the focused graph view. No VSCode imports — safe to import anywhere.
 
-export type NodeRole = 'center' | 'dependency' | 'caller' | 'sibling' | 'caller2' | 'dependency2';
+export type NodeRole = 'center' | 'dependency' | 'caller' | 'sibling';
 export type FocusedEdgeKind = 'extends' | 'implements' | 'uses' | 'calls';
 
 export interface FocusedGraphNode {
@@ -10,7 +10,7 @@ export interface FocusedGraphNode {
   line: number;      // 0-based line of the type declaration
   kind: 'class' | 'interface' | 'enum';
   tags: string[];    // role tags from tree-sitter parse (controller, service, etc.)
-  role: NodeRole;
+  role: NodeRole;    // role relative to the class whose expansion produced this node
 }
 
 export interface FocusedGraphEdge {
@@ -19,15 +19,12 @@ export interface FocusedGraphEdge {
   kind: FocusedEdgeKind;
 }
 
-// Progressive update emitted by focusedGraphBuilder — one per stage.
-// Base stages arrive in order: center → dependencies → callers → siblings.
-// Traverse stages (optional, on demand): traverse-callers → traverse-deps.
+// Progressive update emitted by focusedGraphBuilder while expanding one class.
+// Stages arrive in order: center → dependencies → callers → siblings.
 export type GraphStageUpdate =
-  | { stage: 'center';           node: FocusedGraphNode }
-  | { stage: 'dependencies';     nodes: FocusedGraphNode[]; edges: FocusedGraphEdge[] }
-  | { stage: 'callers';          nodes: FocusedGraphNode[]; edges: FocusedGraphEdge[] }
-  | { stage: 'siblings';         nodes: FocusedGraphNode[]; edges: FocusedGraphEdge[] }
-  | { stage: 'traverse-callers'; nodes: FocusedGraphNode[]; edges: FocusedGraphEdge[] }
-  | { stage: 'traverse-deps';    nodes: FocusedGraphNode[]; edges: FocusedGraphEdge[] };
+  | { stage: 'center';       node: FocusedGraphNode }
+  | { stage: 'dependencies'; nodes: FocusedGraphNode[]; edges: FocusedGraphEdge[] }
+  | { stage: 'callers';      nodes: FocusedGraphNode[]; edges: FocusedGraphEdge[] }
+  | { stage: 'siblings';     nodes: FocusedGraphNode[]; edges: FocusedGraphEdge[] };
 
 export type StageCallback = (update: GraphStageUpdate) => void;

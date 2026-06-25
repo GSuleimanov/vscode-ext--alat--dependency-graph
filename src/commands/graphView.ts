@@ -1,37 +1,38 @@
 import * as vscode from 'vscode';
-import { buildFocusedGraph, buildTraverseExpansion } from '../graph/data/focusedGraphBuilder';
-import { FocusedGraphNode } from '../graph/data/focusedGraphTypes';
+import { buildFocusedGraph } from '../graph/data/focusedGraphBuilder';
 import { providerForUri } from '../graph/lang/registry';
 
 // Side-effect import: registers language providers (java, python).
 import '../graph/lang';
 
+/**
+ * The graph is an editor panel backed by a persistent, accumulating map that the
+ * webview owns: every class keeps its coordinates once placed (and survives reloads
+ * via webview state). This extension side is a stateless build service — it never
+ * forces a redraw. When the active editor changes it merely tells the webview which
+ * file is now active; the webview pans to it if already on the map (no rebuild, no
+ * flicker) or asks for a build only when the class is new or unexpanded.
+ */
 export class GraphSideView {
   static readonly viewId = 'codenav.graphView';
 
   private panel?: vscode.WebviewPanel;
   private cancelCurrent?: () => void;
   private javaReady = false;
-  private currentNodes: FocusedGraphNode[] = [];
 
   constructor(private readonly context: vscode.ExtensionContext) {
-    // Track active editor globally so graph updates whenever the user navigates.
     context.subscriptions.push(
       vscode.window.onDidChangeActiveTextEditor((editor) => {
         if (!this.panel?.visible) { return; }
         const uri = editor?.document.uri;
-        if (this.javaReady && uri && providerForUri(uri.toString())) {
-          void this.loadFocusedGraph(uri);
-        } else if (this.panel) {
-          this.panel.webview.postMessage({ command: 'graphIdle' });
-        }
+        if (uri && providerForUri(uri.toString())) { this.postActiveFile(uri); }
       })
     );
   }
 
   /** Open (or focus) the graph editor panel. */
   reveal(): void {
-    this.ensurePanel();
+    this.ensurePanel().reveal(vscode.ViewColumn.Beside, true);
   }
 
   /** Called from extension.ts once the Java language server is ready. */
@@ -39,23 +40,29 @@ export class GraphSideView {
     this.javaReady = ready;
     if (!this.panel) { return; }
     this.panel.webview.postMessage({ command: 'javaReady', ready });
-    if (ready) {
-      const uri = vscode.window.activeTextEditor?.document.uri;
-      if (uri && providerForUri(uri.toString())) { void this.loadFocusedGraph(uri); }
-    }
+    if (ready) { this.postActiveFile(); }
   }
 
-  /** Called by filteredPeek when a symbol is peeked — re-centres on that file. */
+  /** Called by filteredPeek when a symbol is peeked — bring that class into focus. */
   focusUri(uriStr: string): void {
     if (!providerForUri(uriStr)) { return; }
-    void this.loadFocusedGraph(vscode.Uri.parse(uriStr));
+    this.ensurePanel();
+    this.postActiveFile(vscode.Uri.parse(uriStr));
+  }
+
+  private postActiveFile(uriOverride?: vscode.Uri): void {
+    if (!this.panel) { return; }
+    const uri = uriOverride ?? vscode.window.activeTextEditor?.document.uri;
+    if (!uri || !providerForUri(uri.toString())) { return; }
+    this.panel.webview.postMessage({
+      command: 'activeFile',
+      uri: uri.toString(),
+      name: uri.path.split('/').pop(),
+    });
   }
 
   private ensurePanel(): vscode.WebviewPanel {
-    if (this.panel) {
-      this.panel.reveal(vscode.ViewColumn.Beside, true);
-      return this.panel;
-    }
+    if (this.panel) { return this.panel; }
 
     const panel = vscode.window.createWebviewPanel(
       GraphSideView.viewId,
@@ -67,79 +74,61 @@ export class GraphSideView {
     panel.webview.html = this.getHtml();
 
     panel.webview.onDidReceiveMessage(async (msg) => {
-      if (msg.command === 'navigate' && msg.uri) {
-        const doc = await vscode.workspace.openTextDocument(vscode.Uri.parse(msg.uri));
-        await vscode.window.showTextDocument(doc, {
-          viewColumn: vscode.ViewColumn.One,
-          selection: new vscode.Range(msg.line ?? 0, 0, msg.line ?? 0, 0),
-          preserveFocus: false,
-        });
-      } else if (msg.command === 'ready') {
-        panel.webview.postMessage({ command: 'javaReady', ready: this.javaReady });
-        if (this.javaReady) {
+      switch (msg.command) {
+        case 'ready':
+          panel.webview.postMessage({ command: 'javaReady', ready: this.javaReady });
+          if (this.javaReady) { this.postActiveFile(); }
+          break;
+        case 'requestBuild':
+          if (msg.uri) { void this.buildFor(vscode.Uri.parse(msg.uri)); }
+          break;
+        case 'requestBuildActive': {
           const uri = vscode.window.activeTextEditor?.document.uri;
-          if (uri && providerForUri(uri.toString())) { void this.loadFocusedGraph(uri); }
+          if (uri && providerForUri(uri.toString())) { void this.buildFor(uri); }
+          break;
         }
-      } else if (msg.command === 'traverse') {
-        void this.loadTraverseExpansion();
-      } else if (msg.command === 'traverseReset') {
-        const uri = vscode.window.activeTextEditor?.document.uri;
-        if (uri && providerForUri(uri.toString())) { void this.loadFocusedGraph(uri); }
+        case 'navigate':
+          if (msg.uri) {
+            const doc = await vscode.workspace.openTextDocument(vscode.Uri.parse(msg.uri));
+            await vscode.window.showTextDocument(doc, {
+              viewColumn: vscode.ViewColumn.One,
+              selection: new vscode.Range(msg.line ?? 0, 0, msg.line ?? 0, 0),
+              preserveFocus: false,
+            });
+          }
+          break;
       }
     }, undefined, this.context.subscriptions);
 
+    // Becoming visible again only re-syncs which file is active — never rebuilds a
+    // class that is already on the map.
     panel.onDidChangeViewState(({ webviewPanel }) => {
-      if (webviewPanel.visible && this.javaReady) {
-        const uri = vscode.window.activeTextEditor?.document.uri;
-        if (uri && providerForUri(uri.toString())) { void this.loadFocusedGraph(uri); }
-      }
+      if (webviewPanel.visible) { this.postActiveFile(); }
     }, undefined, this.context.subscriptions);
 
     panel.onDidDispose(() => {
       this.cancelCurrent?.();
-      this.currentNodes = [];
       this.panel = undefined;
     }, undefined, this.context.subscriptions);
 
     return panel;
   }
 
-  private async loadFocusedGraph(uri: vscode.Uri): Promise<void> {
+  /** Expand one class: stream its neighbourhood to the webview, tagged with the file
+   *  it belongs to so the webview can discard results from a superseded build. */
+  private async buildFor(uri: vscode.Uri): Promise<void> {
     if (!this.panel) { return; }
     this.cancelCurrent?.();
     let cancelled = false;
     this.cancelCurrent = () => { cancelled = true; };
-    this.currentNodes = [];
-
-    this.panel.webview.postMessage({ command: 'graphReset', name: uri.path.split('/').pop() });
+    const forUri = uri.toString();
 
     await buildFocusedGraph(
       uri,
       (update) => {
-        if (cancelled) { return; }
-        if (update.stage === 'center') {
-          this.currentNodes = [update.node];
-        } else {
-          this.currentNodes = [...this.currentNodes, ...(update as { nodes: FocusedGraphNode[] }).nodes];
+        if (!cancelled) {
+          this.panel?.webview.postMessage({ command: 'stage', forUri, ...update });
         }
-        this.panel?.webview.postMessage({ command: 'graphStage', ...update });
-      },
-      () => cancelled
-    );
-  }
-
-  private async loadTraverseExpansion(): Promise<void> {
-    if (!this.panel || this.currentNodes.length === 0) { return; }
-    this.cancelCurrent?.();
-    let cancelled = false;
-    this.cancelCurrent = () => { cancelled = true; };
-
-    await buildTraverseExpansion(
-      this.currentNodes,
-      (update) => {
-        if (cancelled) { return; }
-        this.currentNodes = [...this.currentNodes, ...(update as { nodes: FocusedGraphNode[] }).nodes];
-        this.panel?.webview.postMessage({ command: 'graphStage', ...update });
       },
       () => cancelled
     );
@@ -160,7 +149,6 @@ export class GraphSideView {
     #cy { flex: 1; position: relative; min-height: 0; overflow: hidden; }
     canvas { display: block; position: absolute; inset: 0; }
 
-    /* Floating controls */
     #floatBtns { z-index: 5; position: absolute; right: 12px; bottom: 12px; display: flex; gap: 7px; align-items: center; }
     .gbtn {
       background: var(--vscode-editorWidget-background, #252526);
@@ -171,9 +159,7 @@ export class GraphSideView {
       transition: background .12s, border-color .12s, opacity .12s;
     }
     .gbtn:hover { background: var(--vscode-toolbar-hoverBackground, #2a2d2e); border-color: rgba(128,128,128,0.6); }
-    .gbtn.active { border-color: var(--vscode-focusBorder); color: var(--vscode-focusBorder); }
 
-    /* Placeholder / status bar */
     #status { padding: 4px 12px; font-size: 11px; color: var(--vscode-descriptionForeground);
               border-top: 1px solid var(--vscode-panel-border); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     #placeholder { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
@@ -181,7 +167,6 @@ export class GraphSideView {
     #placeholder svg { opacity: .6; }
     #placeholder p { margin: 0; font-size: 13px; }
 
-    /* Java-loading progress bar */
     .loading-bar { width: 120px; height: 2px; background: var(--vscode-panel-border); border-radius: 1px; overflow: hidden; }
     .loading-bar i { display: block; width: 40%; height: 100%; background: var(--vscode-progressBar-background, #0e639c);
                      animation: slide 1.5s infinite ease-in-out; border-radius: 1px; }
@@ -201,8 +186,7 @@ export class GraphSideView {
       <div id="loadingBar" class="loading-bar" style="display:none"><i></i></div>
     </div>
     <div id="floatBtns">
-      <button id="btnTraverse" class="gbtn" title="Show one extra level of callers and dependencies">Traverse</button>
-      <button id="btnRecenter" class="gbtn" title="Re-centre view on the active class">Recenter</button>
+      <button id="btnReset" class="gbtn" title="Clear the map and show only the current class">Reset</button>
     </div>
   </div>
   <div id="status"></div>
@@ -214,86 +198,77 @@ export class GraphSideView {
     const placeholderEl  = document.getElementById('placeholder');
     const placeholderMsg = document.getElementById('placeholderMsg');
     const loadingBarEl   = document.getElementById('loadingBar');
-    const btnTraverse    = document.getElementById('btnTraverse');
-    const btnRecenter    = document.getElementById('btnRecenter');
+    const btnReset       = document.getElementById('btnReset');
 
-    // ── state ─────────────────────────────────────────────────────────────────
-    let nodeMap = new Map();   // id → { ...FocusedGraphNode, x, y }
-    let edges   = [];
-    let centerNodeId   = null;
-    let traverseActive = false;
-    let view    = { x: 0, y: 0, scale: 1 };
+    // ── persistent map (single source of truth) ────────────────────────────────
+    // nodeMap: id -> { id,name,uri,line,kind,tags, x,y, expanded }
+    let nodeMap = new Map();
+    let edges   = [];                 // { from, to, kind }
+    let edgeKeys = new Set();         // 'from|to' — dedup directed pairs
+    let activeId = null;
+    let view = { x: 0, y: 0, scale: 1 };
+
+    // transient
+    let javaReady = false;
+    let pendingActive = null;         // uri awaited until java is ready
+    let currentBuildUri = null;       // newest in-flight build; older stages ignored
+    let buildRootId = null;           // id the current build's neighbours hang off
     let hoverNode = null;
     let dpr = 1, viewW = 0, viewH = 0;
 
-    // ── layout ────────────────────────────────────────────────────────────────
-    const ROW_Y = { caller2: -480, caller: -240, sibling: 0, center: 0, dependency: 240, dependency2: 480 };
-    const X_GAP = 170;
+    const X_GAP = 175, LEVEL_Y = 210, MIN_DIST = 82, NODE_R = 16;
 
-    function layoutNodes() {
-      const all      = [...nodeMap.values()];
-      const callers2 = all.filter(n => n.role === 'caller2');
-      const callers  = all.filter(n => n.role === 'caller');
-      const deps     = all.filter(n => n.role === 'dependency');
-      const deps2    = all.filter(n => n.role === 'dependency2');
-      const center   = all.find(n => n.role === 'center');
-      const siblings = all.filter(n => n.role === 'sibling');
-
-      function placeRow(group, y) {
-        const total = group.length;
-        group.forEach((n, i) => {
-          n.x = total === 1 ? 0 : -(total - 1) * X_GAP / 2 + i * X_GAP;
-          n.y = y;
-        });
+    // ── restore saved map ──────────────────────────────────────────────────────
+    (function restore() {
+      const s = vscode.getState();
+      if (s && Array.isArray(s.nodes) && s.nodes.length) {
+        for (const n of s.nodes) { nodeMap.set(n.id, n); }
+        edges = Array.isArray(s.edges) ? s.edges : [];
+        for (const e of edges) { edgeKeys.add(e.from + '|' + e.to); }
+        activeId = s.activeId || null;
+        if (s.view) { view = s.view; }
       }
+    })();
 
-      placeRow(callers2, ROW_Y.caller2);
-      placeRow(callers,  ROW_Y.caller);
-      placeRow(deps,     ROW_Y.dependency);
-      placeRow(deps2,    ROW_Y.dependency2);
-
-      if (center) {
-        const half = Math.floor(siblings.length / 2);
-        const row  = [...siblings.slice(0, half), center, ...siblings.slice(half)];
-        placeRow(row, ROW_Y.center);
-      }
+    let saveTimer = null;
+    function scheduleSave() {
+      if (saveTimer) { return; }
+      saveTimer = setTimeout(() => {
+        saveTimer = null;
+        vscode.setState({ nodes: [...nodeMap.values()], edges, activeId, view });
+      }, 250);
     }
 
-    // ── canvas setup ──────────────────────────────────────────────────────────
+    // ── canvas / theme ─────────────────────────────────────────────────────────
     function applyCanvasSize(w, h) {
       dpr = window.devicePixelRatio || 1;
       viewW = w; viewH = h;
-      canvas.width  = Math.round(w * dpr);
-      canvas.height = Math.round(h * dpr);
-      canvas.style.width  = w + 'px';
-      canvas.style.height = h + 'px';
+      canvas.width = Math.round(w * dpr); canvas.height = Math.round(h * dpr);
+      canvas.style.width = w + 'px'; canvas.style.height = h + 'px';
     }
-
     function handleResize() {
       const r = canvas.parentElement.getBoundingClientRect();
       const nw = Math.round(r.width), nh = Math.round(r.height);
       if (nw === viewW && nh === viewH && (window.devicePixelRatio || 1) === dpr) { return; }
       applyCanvasSize(nw, nh);
-      if (nodeMap.size) { fitView(); }
       draw();
     }
     new ResizeObserver(() => handleResize()).observe(canvas.parentElement);
     window.addEventListener('resize', () => handleResize());
 
-    // ── theme ─────────────────────────────────────────────────────────────────
-    function cssVar(name, fallback) {
-      return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || fallback;
+    function cssVar(name, fb) {
+      return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || fb;
     }
     let T = {};
     function refreshTheme() {
       T = {
-        fill:       cssVar('--vscode-button-background', '#0e639c'),
-        fillFocus:  cssVar('--vscode-charts-green', '#4ec9b0'),
-        text:       cssVar('--vscode-foreground', '#cccccc'),
-        glyphText:  cssVar('--vscode-button-foreground', '#ffffff'),
-        border:     cssVar('--vscode-panel-border', '#80808060'),
-        labelBg:    cssVar('--vscode-editorHoverWidget-background', '#252526'),
-        labelBdr:   cssVar('--vscode-editorHoverWidget-border', '#454545'),
+        fill:      cssVar('--vscode-button-background', '#0e639c'),
+        fillFocus: cssVar('--vscode-charts-green', '#4ec9b0'),
+        text:      cssVar('--vscode-foreground', '#cccccc'),
+        glyphText: cssVar('--vscode-button-foreground', '#ffffff'),
+        border:    cssVar('--vscode-panel-border', '#80808060'),
+        labelBg:   cssVar('--vscode-editorHoverWidget-background', '#252526'),
+        labelBdr:  cssVar('--vscode-editorHoverWidget-border', '#454545'),
         edge: {
           extends:    cssVar('--vscode-charts-green',  '#4ec9b0'),
           implements: cssVar('--vscode-charts-purple', '#c586c0'),
@@ -303,47 +278,93 @@ export class GraphSideView {
       };
     }
 
-    // ── fit / focus ───────────────────────────────────────────────────────────
-    function fitView() {
-      const nodes = [...nodeMap.values()];
-      if (!nodes.length) { return; }
-      let mnX = Infinity, mnY = Infinity, mxX = -Infinity, mxY = -Infinity;
-      for (const n of nodes) { mnX = Math.min(mnX,n.x); mnY = Math.min(mnY,n.y); mxX = Math.max(mxX,n.x); mxY = Math.max(mxY,n.y); }
-      const pad = 90;
-      const gw = (mxX-mnX)||1, gh = (mxY-mnY)||1;
-      view.scale = Math.min((viewW-pad)/gw, (viewH-pad)/gh, 1.8);
-      view.x = viewW/2 - (mnX+mxX)/2 * view.scale;
-      view.y = viewH/2 - (mnY+mxY)/2 * view.scale;
+    // ── placement (incremental, position-stable) ───────────────────────────────
+    function cameraCenterGraph() {
+      return { x: (viewW / 2 - view.x) / view.scale, y: (viewH / 2 - view.y) / view.scale };
+    }
+    // Nudge a target spot away from the nearest existing node so new regions don't
+    // pile on top of what's already placed. A few relaxation steps is enough.
+    function freeSpot(x, y) {
+      for (let iter = 0; iter < 14; iter++) {
+        let dx = 0, dy = 0, d = Infinity;
+        for (const m of nodeMap.values()) {
+          const ex = x - m.x, ey = y - m.y, ed = Math.hypot(ex, ey);
+          if (ed < d) { d = ed; dx = ex; dy = ey; }
+        }
+        if (d >= MIN_DIST) { return { x, y }; }
+        const len = d || 0.001;
+        const push = (MIN_DIST - d) + 2;
+        x += (dx / len) * push; y += (dy / len) * push;
+      }
+      return { x, y };
+    }
+    function placeNew(node, x, y) {
+      const spot = freeSpot(x, y);
+      nodeMap.set(node.id, { ...node, x: spot.x, y: spot.y, expanded: false });
+    }
+    function placeGroup(root, nodes, dirY) {
+      const fresh = nodes.filter(n => !nodeMap.has(n.id));
+      const total = fresh.length;
+      fresh.forEach((n, i) => {
+        const x = root.x + (total === 1 ? 0 : (i - (total - 1) / 2) * X_GAP);
+        placeNew(n, x, root.y + dirY);
+      });
+    }
+    function addEdge(e) {
+      const k = e.from + '|' + e.to;
+      if (!edgeKeys.has(k)) { edgeKeys.add(k); edges.push(e); }
     }
 
-    // ── drawing helpers ───────────────────────────────────────────────────────
-    const NODE_R = 16;
-    function toScreen(n) { return { x: n.x*view.scale+view.x, y: n.y*view.scale+view.y }; }
+    // ── camera animation ───────────────────────────────────────────────────────
+    let anim = null;
+    function animateToNode(n) {
+      const tx = viewW / 2 - n.x * view.scale;
+      const ty = viewH / 2 - n.y * view.scale;
+      const sx = view.x, sy = view.y;
+      const start = performance.now(), dur = 240;
+      anim = start;
+      function step(now) {
+        if (anim !== start) { return; }      // superseded
+        const t = Math.min(1, (now - start) / dur);
+        const e = 1 - Math.pow(1 - t, 3);    // easeOutCubic
+        view.x = sx + (tx - sx) * e;
+        view.y = sy + (ty - sy) * e;
+        draw();
+        if (t < 1) { requestAnimationFrame(step); } else { anim = null; scheduleSave(); }
+      }
+      requestAnimationFrame(step);
+    }
+
+    // ── drawing ────────────────────────────────────────────────────────────────
+    function toScreen(n) { return { x: n.x * view.scale + view.x, y: n.y * view.scale + view.y }; }
+
+    function glyphFor(n) {
+      const t = n.tags || [];
+      if (t.includes('test'))         { return 'T'; }
+      if (t.includes('controller'))   { return 'C'; }
+      if (t.includes('eventHandler')) { return 'H'; }
+      if (t.includes('service'))      { return 'S'; }
+      if (t.includes('repository'))   { return 'R'; }
+      return null;
+    }
 
     function drawNode(n) {
       const s = toScreen(n);
-      const isCenter   = n.role === 'center';
-      const isSibling  = n.role === 'sibling';
-      const isTraverse = n.role === 'caller2' || n.role === 'dependency2';
-      const isHover    = n === hoverNode;
-      const r = (NODE_R - (isTraverse ? 3 : 0)) + (isHover ? 3 : 0);
-      const alpha = isSibling ? 0.35 : (isTraverse ? 0.55 : 1);
-
-      ctx.globalAlpha = alpha;
+      const isActive = n.id === activeId;
+      const isHover  = n === hoverNode;
+      const r = NODE_R + (isHover ? 3 : 0);
 
       if (isHover) {
-        ctx.beginPath(); ctx.arc(s.x, s.y, r+5, 0, Math.PI*2);
-        ctx.fillStyle = T.fill; ctx.globalAlpha = 0.18; ctx.fill();
-        ctx.globalAlpha = alpha;
+        ctx.beginPath(); ctx.arc(s.x, s.y, r + 5, 0, Math.PI * 2);
+        ctx.fillStyle = T.fill; ctx.globalAlpha = 0.18; ctx.fill(); ctx.globalAlpha = 1;
       }
 
-      ctx.beginPath(); ctx.arc(s.x, s.y, r, 0, Math.PI*2);
-      ctx.fillStyle   = isCenter ? T.fillFocus : T.fill;
+      ctx.beginPath(); ctx.arc(s.x, s.y, r, 0, Math.PI * 2);
+      ctx.fillStyle   = isActive ? T.fillFocus : T.fill;
       ctx.strokeStyle = isHover ? T.text : T.border;
-      ctx.lineWidth   = (isCenter || isHover) ? 2 : 0.8;
+      ctx.lineWidth   = (isActive || isHover) ? 2 : 0.8;
       ctx.fill(); ctx.stroke();
 
-      // Role glyph
       const glyph = glyphFor(n);
       if (glyph) {
         ctx.fillStyle = T.glyphText;
@@ -352,101 +373,63 @@ export class GraphSideView {
         ctx.fillText(glyph, s.x, s.y);
       }
 
-      // Label — angled 35°, hidden when hovering (tooltip replaces it)
       if (!isHover) {
+        // Label angled 35° to reduce horizontal overlap between neighbours.
         ctx.save();
         ctx.translate(s.x, s.y - r - 6);
         ctx.rotate(35 * Math.PI / 180);
         ctx.fillStyle = T.text;
-        ctx.font = (isCenter ? 'bold ' : '') + '11px var(--vscode-font-family)';
+        ctx.font = (isActive ? 'bold ' : '') + '11px var(--vscode-font-family)';
         ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
-        ctx.globalAlpha = alpha;
         ctx.fillText(n.name, 0, 0);
         ctx.restore();
-      }
-
-      // Hover tooltip (replaces the label)
-      if (isHover) {
-        ctx.globalAlpha = 1;
+      } else {
+        // Hover tooltip replaces the angled label (no double text).
         ctx.font = 'bold 12px var(--vscode-font-family)';
         const tw = ctx.measureText(n.name).width;
-        const px=7, bw=tw+px*2, bh=20;
-        const bx=s.x-bw/2, by=s.y-r-10-bh;
+        const bw = tw + 14, bh = 20, bx = s.x - bw / 2, by = s.y - r - 10 - bh;
         ctx.fillStyle = T.labelBg;
-        ctx.beginPath(); ctx.roundRect(bx,by,bw,bh,4); ctx.fill();
+        ctx.beginPath(); ctx.roundRect(bx, by, bw, bh, 4); ctx.fill();
         ctx.strokeStyle = T.labelBdr; ctx.lineWidth = 0.8; ctx.stroke();
-        ctx.fillStyle = T.text; ctx.textAlign='center'; ctx.textBaseline='middle';
-        ctx.fillText(n.name, s.x, by+bh/2);
+        ctx.fillStyle = T.text; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        ctx.fillText(n.name, s.x, by + bh / 2);
         ctx.textBaseline = 'alphabetic';
       }
-
-      ctx.globalAlpha = 1;
-    }
-
-    function glyphFor(n) {
-      const t = n.tags || [];
-      if (t.includes('test'))        { return 'T'; }
-      if (t.includes('controller'))  { return 'C'; }
-      if (t.includes('eventHandler')){ return 'H'; }
-      if (t.includes('service'))     { return 'S'; }
-      if (t.includes('repository'))  { return 'R'; }
-      return null;
     }
 
     function edgeSeed(from, to) {
-      let h = 5381; const s = from+'\0'+to;
-      for (let i=0;i<s.length;i++){h=((h<<5)+h+s.charCodeAt(i))>>>0;}
+      let h = 5381; const s = from + '\\0' + to;
+      for (let i = 0; i < s.length; i++) { h = ((h << 5) + h + s.charCodeAt(i)) >>> 0; }
       return h;
     }
-
     function drawEdge(e) {
       const a = nodeMap.get(e.from), b = nodeMap.get(e.to);
       if (!a || !b) { return; }
       const A = toScreen(a), B = toScreen(b);
-      const isTraverseEdge = (a.role === 'caller2' || a.role === 'dependency2' ||
-                              b.role === 'caller2' || b.role === 'dependency2');
-      ctx.strokeStyle = T.edge[e.kind] ?? T.edge.uses;
-      ctx.fillStyle   = T.edge[e.kind] ?? T.edge.uses;
-      ctx.lineWidth = 1.2; ctx.globalAlpha = isTraverseEdge ? 0.4 : 0.7;
+      ctx.strokeStyle = T.edge[e.kind] || T.edge.uses;
+      ctx.fillStyle   = T.edge[e.kind] || T.edge.uses;
+      ctx.lineWidth = 1.2; ctx.globalAlpha = 0.7;
 
-      const ux0=B.x-A.x, uy0=B.y-A.y, L=Math.hypot(ux0,uy0)||1;
-      const ux=ux0/L, uy=uy0/L;
-      const HEAD=9;
-      const rA = NODE_R - ((a.role==='caller2'||a.role==='dependency2') ? 3 : 0);
-      const rB = NODE_R - ((b.role==='caller2'||b.role==='dependency2') ? 3 : 0);
-      const start={ x: A.x+ux*(rA+1), y: A.y+uy*(rA+1) };
-      const tip  ={ x: B.x-ux*(rB+1.5), y: B.y-uy*(rB+1.5) };
+      const ux0 = B.x - A.x, uy0 = B.y - A.y, L = Math.hypot(ux0, uy0) || 1;
+      const ux = ux0 / L, uy = uy0 / L, HEAD = 9;
+      const start = { x: A.x + ux * (NODE_R + 1), y: A.y + uy * (NODE_R + 1) };
+      const tip   = { x: B.x - ux * (NODE_R + 1.5), y: B.y - uy * (NODE_R + 1.5) };
 
-      const seed=edgeSeed(e.from,e.to);
-      const bowMag=(Math.hypot(tip.x-start.x,tip.y-start.y)/2)*Math.tan((3+(seed%8))*Math.PI/180)*((seed&1)?1:-1);
-      const mx=(start.x+tip.x)/2, my=(start.y+tip.y)/2;
-      const cpx=mx-uy*bowMag, cpy=my+ux*bowMag;
+      const seed = edgeSeed(e.from, e.to);
+      const bowMag = (Math.hypot(tip.x - start.x, tip.y - start.y) / 2) * Math.tan((3 + (seed % 8)) * Math.PI / 180) * ((seed & 1) ? 1 : -1);
+      const mx = (start.x + tip.x) / 2, my = (start.y + tip.y) / 2;
+      const cpx = mx - uy * bowMag, cpy = my + ux * bowMag;
 
-      const tdx=tip.x-cpx, tdy=tip.y-cpy, tL=Math.hypot(tdx,tdy)||1;
-      const tx=tdx/tL, ty=tdy/tL;
-      const end={ x:tip.x-tx*HEAD, y:tip.y-ty*HEAD };
+      const tdx = tip.x - cpx, tdy = tip.y - cpy, tL = Math.hypot(tdx, tdy) || 1;
+      const tx = tdx / tL, ty = tdy / tL;
+      const end = { x: tip.x - tx * HEAD, y: tip.y - ty * HEAD };
 
-      ctx.beginPath(); ctx.moveTo(start.x,start.y); ctx.quadraticCurveTo(cpx,cpy,end.x,end.y); ctx.stroke();
-
-      const ang=Math.atan2(ty,tx);
-      ctx.beginPath(); ctx.moveTo(tip.x,tip.y);
-      ctx.lineTo(tip.x-Math.cos(ang-0.42)*9, tip.y-Math.sin(ang-0.42)*9);
-      ctx.lineTo(tip.x-Math.cos(ang+0.42)*9, tip.y-Math.sin(ang+0.42)*9);
+      ctx.beginPath(); ctx.moveTo(start.x, start.y); ctx.quadraticCurveTo(cpx, cpy, end.x, end.y); ctx.stroke();
+      const ang = Math.atan2(ty, tx);
+      ctx.beginPath(); ctx.moveTo(tip.x, tip.y);
+      ctx.lineTo(tip.x - Math.cos(ang - 0.42) * 9, tip.y - Math.sin(ang - 0.42) * 9);
+      ctx.lineTo(tip.x - Math.cos(ang + 0.42) * 9, tip.y - Math.sin(ang + 0.42) * 9);
       ctx.closePath(); ctx.fill();
-      ctx.globalAlpha = 1;
-    }
-
-    function drawRowLabels() {
-      if (!nodeMap.size) { return; }
-      const all = [...nodeMap.values()];
-      ctx.font = '10px var(--vscode-font-family)';
-      ctx.fillStyle = T.text; ctx.globalAlpha = 0.35;
-      ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
-      const lx = 8;
-      if (all.some(n => n.role === 'caller2'))    { ctx.fillText('Callers ›',     lx, ROW_Y.caller2     *view.scale+view.y); }
-      if (all.some(n => n.role === 'caller'))      { ctx.fillText('Callers',       lx, ROW_Y.caller      *view.scale+view.y); }
-      if (all.some(n => n.role === 'dependency'))  { ctx.fillText('Dependencies',  lx, ROW_Y.dependency  *view.scale+view.y); }
-      if (all.some(n => n.role === 'dependency2')) { ctx.fillText('Dependencies ›',lx, ROW_Y.dependency2 *view.scale+view.y); }
       ctx.globalAlpha = 1;
     }
 
@@ -455,149 +438,191 @@ export class GraphSideView {
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.clearRect(0, 0, viewW, viewH);
       edges.forEach(drawEdge);
-      // Paint center on top; traverse nodes below everything else.
-      const ordered = [...nodeMap.values()].sort((a, b) => {
-        const rank = r => r==='center' ? 3 : (r==='caller'||r==='dependency') ? 2 : (r==='sibling') ? 1 : 0;
-        return rank(a.role) - rank(b.role);
-      });
-      const withHover = hoverNode ? [...ordered.filter(n=>n!==hoverNode), hoverNode] : ordered;
+      // Active node paints last (on top); hovered node above that.
+      const ordered = [...nodeMap.values()].sort((a, b) => (a.id === activeId ? 1 : 0) - (b.id === activeId ? 1 : 0));
+      const withHover = hoverNode ? [...ordered.filter(n => n !== hoverNode), hoverNode] : ordered;
       withHover.forEach(drawNode);
-      drawRowLabels();
     }
 
-    // ── message handling ──────────────────────────────────────────────────────
+    function updateStatus(stageDots) {
+      statusEl.textContent = nodeMap.size + ' classes · ' + edges.length + ' relationships' + (stageDots || '');
+    }
+
+    // ── focus / build orchestration ────────────────────────────────────────────
+    function findByUri(uri) {
+      let fallback = null;
+      for (const n of nodeMap.values()) {
+        if (n.uri === uri) { if (n.expanded) { return n; } if (!fallback) { fallback = n; } }
+      }
+      return fallback;
+    }
+    function setActive(n) {
+      activeId = n.id;
+      animateToNode(n);
+      placeholderEl.style.display = 'none';
+      updateStatus();
+      scheduleSave();
+    }
+    function requestBuild(uri) {
+      currentBuildUri = uri;
+      if (nodeMap.size === 0) {
+        placeholderEl.style.display = 'flex';
+        loadingBarEl.style.display = 'none';
+        placeholderMsg.textContent = 'Building graph…';
+      }
+      vscode.postMessage({ command: 'requestBuild', uri: uri });
+    }
+    function focusFile(uri) {
+      if (!javaReady) { pendingActive = uri; return; }
+      const n = findByUri(uri);
+      if (n) { setActive(n); if (!n.expanded) { requestBuild(uri); } }
+      else   { requestBuild(uri); }
+    }
+    function activateNode(n) {
+      setActive(n);
+      if (!n.expanded) { requestBuild(n.uri); }
+    }
+
+    // ── message handling ───────────────────────────────────────────────────────
     window.addEventListener('message', ({ data: msg }) => {
       if (msg.command === 'javaReady') {
+        javaReady = msg.ready;
         if (!msg.ready) {
-          placeholderEl.style.display = 'flex';
-          placeholderMsg.textContent  = 'Java language server starting…';
-          loadingBarEl.style.display  = 'block';
-        } else {
-          loadingBarEl.style.display  = 'none';
           if (nodeMap.size === 0) {
-            placeholderMsg.textContent = 'Open a Java class to explore its graph';
+            placeholderEl.style.display = 'flex';
+            placeholderMsg.textContent = 'Java language server starting…';
+            loadingBarEl.style.display = 'block';
           }
+        } else {
+          loadingBarEl.style.display = 'none';
+          if (nodeMap.size === 0) { placeholderMsg.textContent = 'Open a Java class to explore its graph'; }
+          if (pendingActive) { const u = pendingActive; pendingActive = null; focusFile(u); }
         }
         return;
       }
 
-      if (msg.command === 'graphReset') {
-        nodeMap.clear(); edges = []; centerNodeId = null; hoverNode = null;
-        traverseActive = false;
-        btnTraverse.classList.remove('active');
-        loadingBarEl.style.display  = 'none';
-        placeholderEl.style.display = 'flex';
-        placeholderMsg.textContent  = 'Building graph for ' + msg.name + '…';
-        statusEl.textContent = '';
-        if (viewW === 0) { handleResize(); }
-        draw();
-        return;
-      }
+      if (msg.command === 'activeFile') { focusFile(msg.uri); return; }
 
-      if (msg.command === 'graphIdle') {
-        nodeMap.clear(); edges = []; centerNodeId = null; hoverNode = null;
-        traverseActive = false;
-        btnTraverse.classList.remove('active');
-        placeholderEl.style.display = 'flex';
-        placeholderMsg.textContent = 'Open a Java class to explore its graph';
-        statusEl.textContent = '';
-        draw();
-        return;
-      }
-
-      if (msg.command === 'graphStage') {
-        const isFirst = nodeMap.size === 0;
+      if (msg.command === 'stage') {
+        if (msg.forUri && msg.forUri !== currentBuildUri) { return; }   // stale build
         placeholderEl.style.display = 'none';
 
         if (msg.stage === 'center') {
-          nodeMap.set(msg.node.id, { ...msg.node });
-          centerNodeId = msg.node.id;
+          let node = nodeMap.get(msg.node.id);
+          if (!node) {
+            if (nodeMap.size === 0) {
+              // First class ever: anchor at origin, centre the camera on it.
+              nodeMap.set(msg.node.id, { ...msg.node, x: 0, y: 0, expanded: true });
+              view = { x: viewW / 2, y: viewH / 2, scale: 1 };
+            } else {
+              const c = cameraCenterGraph();
+              placeNew(msg.node, c.x, c.y);
+            }
+            node = nodeMap.get(msg.node.id);
+          }
+          node.expanded = true;
+          buildRootId = node.id;
+          setActive(node);
         } else {
-          for (const n of msg.nodes) { nodeMap.set(n.id, { ...n }); }
-          for (const e of msg.edges) { edges.push(e); }
+          const root = nodeMap.get(buildRootId);
+          if (!root) { return; }
+          const dirY = msg.stage === 'callers' ? -LEVEL_Y : msg.stage === 'dependencies' ? LEVEL_Y : 0;
+          placeGroup(root, msg.nodes, dirY);
+          for (const e of msg.edges) { addEdge(e); }
         }
 
-        layoutNodes();
-
-        if (isFirst || msg.stage === 'center') { fitView(); }
-
-        const nCount = nodeMap.size, eCount = edges.length;
-        const dots = { center:'·', dependencies:'··', callers:'···', siblings:'····',
-                       'traverse-callers':'·····', 'traverse-deps':'······' };
-        statusEl.textContent = nCount + ' classes · ' + eCount + ' relationships' + (dots[msg.stage] || '');
-
+        const dots = { center: '·', dependencies: '··', callers: '···', siblings: '····' };
+        updateStatus(dots[msg.stage] || '');
         draw();
+        scheduleSave();
         return;
       }
     });
 
-    // ── interaction ───────────────────────────────────────────────────────────
-    let dragging=null, panning=false, last=null, mouseDownPos=null, didMove=false;
+    // ── interaction ────────────────────────────────────────────────────────────
+    let dragging = null, panning = false, last = null, downPos = null, didMove = false;
+    let clickTimer = null, lastClickId = null, lastClickTime = 0;
 
     function pick(px, py) {
       const nodes = [...nodeMap.values()];
-      for (let i=nodes.length-1;i>=0;i--) {
+      for (let i = nodes.length - 1; i >= 0; i--) {
         const s = toScreen(nodes[i]);
-        const r = NODE_R - ((nodes[i].role==='caller2'||nodes[i].role==='dependency2') ? 3 : 0);
-        if ((px-s.x)**2+(py-s.y)**2 <= (r+4)**2) { return nodes[i]; }
+        if ((px - s.x) ** 2 + (py - s.y) ** 2 <= (NODE_R + 4) ** 2) { return nodes[i]; }
       }
       return null;
     }
 
     canvas.addEventListener('mousedown', e => {
-      mouseDownPos = { x:e.offsetX, y:e.offsetY };
-      last = { x:e.offsetX, y:e.offsetY }; didMove = false;
+      downPos = { x: e.offsetX, y: e.offsetY };
+      last = { x: e.offsetX, y: e.offsetY }; didMove = false;
       const hit = pick(e.offsetX, e.offsetY);
       if (hit) { dragging = hit; } else { panning = true; }
     });
 
     canvas.addEventListener('mousemove', e => {
-      const dx=e.offsetX-(last?.x??e.offsetX), dy=e.offsetY-(last?.y??e.offsetY);
-      if (Math.abs(dx)+Math.abs(dy)>3) { didMove=true; }
-      if (dragging) {
-        dragging.x += dx/view.scale; dragging.y += dy/view.scale; draw();
-      } else if (panning && last) {
-        view.x += dx; view.y += dy; draw();
-      }
-      last = { x:e.offsetX, y:e.offsetY };
+      const dx = e.offsetX - (last ? last.x : e.offsetX), dy = e.offsetY - (last ? last.y : e.offsetY);
+      if (Math.abs(dx) + Math.abs(dy) > 3) { didMove = true; }
+      if (dragging) { dragging.x += dx / view.scale; dragging.y += dy / view.scale; draw(); }
+      else if (panning && last) { anim = null; view.x += dx; view.y += dy; draw(); }
+      last = { x: e.offsetX, y: e.offsetY };
       const hit = pick(e.offsetX, e.offsetY);
-      if (hit !== hoverNode) { hoverNode=hit; canvas.style.cursor=hit?'pointer':'default'; draw(); }
+      if (hit !== hoverNode) { hoverNode = hit; canvas.style.cursor = hit ? 'pointer' : 'default'; draw(); }
     });
 
     window.addEventListener('mouseup', () => {
-      if (!didMove && mouseDownPos) {
-        const hit = pick(mouseDownPos.x, mouseDownPos.y);
-        if (hit) { vscode.postMessage({ command:'navigate', uri:hit.uri, line:hit.line }); }
+      if (!didMove && downPos) {
+        const hit = pick(downPos.x, downPos.y);
+        if (hit) {
+          const now = Date.now();
+          if (lastClickId === hit.id && now - lastClickTime < 300) {
+            // double-click → open the file in the editor
+            if (clickTimer) { clearTimeout(clickTimer); clickTimer = null; }
+            lastClickId = null;
+            vscode.postMessage({ command: 'navigate', uri: hit.uri, line: hit.line });
+          } else {
+            // single-click → make active, pan, expand (deferred so a double-click can cancel)
+            lastClickId = hit.id; lastClickTime = now;
+            if (clickTimer) { clearTimeout(clickTimer); }
+            clickTimer = setTimeout(() => { clickTimer = null; activateNode(hit); }, 230);
+          }
+        }
       }
-      dragging=null; panning=false; last=null; mouseDownPos=null;
+      if (didMove && dragging) { scheduleSave(); }
+      if (didMove && panning) { scheduleSave(); }
+      dragging = null; panning = false; last = null; downPos = null;
     });
 
     canvas.addEventListener('mouseleave', () => {
-      if (hoverNode) { hoverNode=null; canvas.style.cursor='default'; draw(); }
+      if (hoverNode) { hoverNode = null; canvas.style.cursor = 'default'; draw(); }
     });
 
     canvas.addEventListener('wheel', e => {
-      e.preventDefault();
+      e.preventDefault(); anim = null;
       const f = e.deltaY < 0 ? 1.06 : 0.94;
-      const cx=viewW/2, cy=viewH/2;
-      view.x = cx-(cx-view.x)*f; view.y = cy-(cy-view.y)*f; view.scale *= f;
-      draw();
+      const cx = e.offsetX, cy = e.offsetY;
+      view.x = cx - (cx - view.x) * f; view.y = cy - (cy - view.y) * f; view.scale *= f;
+      draw(); scheduleSave();
     }, { passive: false });
 
-    btnRecenter.addEventListener('click', () => {
-      if (centerNodeId) { const n=nodeMap.get(centerNodeId); if(n){fitView();draw();} }
-    });
-
-    btnTraverse.addEventListener('click', () => {
-      if (nodeMap.size === 0) { return; }
-      traverseActive = !traverseActive;
-      btnTraverse.classList.toggle('active', traverseActive);
-      vscode.postMessage({ command: traverseActive ? 'traverse' : 'traverseReset' });
+    btnReset.addEventListener('click', () => {
+      nodeMap.clear(); edges = []; edgeKeys.clear(); activeId = null; hoverNode = null;
+      buildRootId = null; currentBuildUri = null;
+      placeholderEl.style.display = 'flex';
+      placeholderMsg.textContent = 'Building graph…';
+      statusEl.textContent = '';
+      vscode.setState(null);
+      draw();
+      vscode.postMessage({ command: 'requestBuildActive' });
     });
 
     new MutationObserver(() => draw()).observe(document.body, {
-      attributes: true, attributeFilter: ['data-vscode-theme-kind','data-vscode-theme-name','class'],
+      attributes: true, attributeFilter: ['data-vscode-theme-kind', 'data-vscode-theme-name', 'class'],
     });
+
+    // initial paint of any restored map
+    handleResize();
+    if (nodeMap.size) { placeholderEl.style.display = 'none'; updateStatus(); }
+    draw();
 
     vscode.postMessage({ command: 'ready' });
   </script>

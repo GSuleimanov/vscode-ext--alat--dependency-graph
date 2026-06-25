@@ -36,9 +36,19 @@
       {
         "command": "codenav.openGraph",
         "title": "Open Project Graph",
-        "category": "Codenav"
+        "category": "Codenav",
+        "icon": "$(type-hierarchy)"
       }
     ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "codenav.openGraph",
+          "when": "view == codenav.referencesView",
+          "group": "navigation"
+        }
+      ]
+    },
     "views": {
       "panel": [
         {

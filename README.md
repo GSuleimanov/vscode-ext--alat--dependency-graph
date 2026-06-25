@@ -15,9 +15,9 @@ Press **`Shift+Alt+F12`** on any Java symbol to open the **Codenav References** 
 - **Filters out the noise** — import statements and test-source results are hidden by default (configurable).
 - **Keyboard-first preview** — arrow through results to preview each location inline.
 
-### 🕸️ Focused class graph
+### 🕸️ Explorable class graph
 
-Run **`Codenav: Open Project Graph`** from the command palette to open the graph panel. The graph builds around whichever class is currently open:
+Run **`Codenav: Open Project Graph`** from the command palette — or click the graph icon in the **Codenav References** title bar — to open the graph as an editor tab. The graph builds around whichever class is currently active:
 
 ```
   [ CallerA ]     [ CallerB ]        ← classes that inject this class as a field
@@ -27,7 +27,14 @@ Run **`Codenav: Open Project Graph`** from the command palette to open the graph
   [ FieldDepA ]  [ FieldDepB ]  [ ParentClass ]            ← what this class uses
 ```
 
-The graph updates automatically as you navigate between files. It renders in stages for instant feedback — the active class and its field dependencies appear in milliseconds (tree-sitter), callers and siblings fill in as the language server responds.
+The graph is a **persistent, explorable map** rather than a snapshot:
+
+- **Stable coordinates** — every class keeps its place once drawn. Switching editors or hiding the panel never reshuffles the map; the camera simply pans to the active class. The layout is remembered across reloads.
+- **Single-click** a node to make it active — the camera glides to it and its neighbourhood (callers, dependencies, siblings) expands in place, growing the map one region at a time.
+- **Double-click** a node to jump to that class in the editor.
+- **Reset** collapses the map back to just the current class.
+
+It renders in stages for instant feedback — the active class and its field dependencies appear in milliseconds (tree-sitter), callers and siblings fill in as the language server responds.
 
 #### How the hybrid engine works
 
@@ -46,10 +53,10 @@ This means the graph never scans the whole workspace on load. It reads exactly o
 | Action | How |
 | --- | --- |
 | Filtered Find References | `Shift+Alt+F12` on a Java symbol |
-| Open Project Graph | Command Palette → `Codenav: Open Project Graph` |
+| Open Project Graph | Command Palette → `Codenav: Open Project Graph`, or the graph icon in the References title bar |
+| Explore the graph | Single-click a node to focus & expand it · double-click to open the file · **Reset** to collapse to the current class |
 
-The References and Project Graph panels appear in the VSCode bottom panel area.
-For better experience put it on Secondary panel.
+The References panel appears in the VSCode bottom panel area (for a better experience put it on the Secondary panel). The Project Graph opens as an editor tab, so it sits beside your code.
 I preffer `Shift+CMD+Enter` for a fluent experience: (`CMD+Enter` - go to definition with fallback to references), and adding `Shift` to that - you get better usage map.
 Once Codenav References is focused, you can scroll through the references using arrows. Enter will jump the cursor to the file, Esc will return to the place from where you invoked Codenav References.
 
