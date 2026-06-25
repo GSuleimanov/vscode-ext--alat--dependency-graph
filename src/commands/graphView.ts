@@ -149,6 +149,9 @@ export class GraphSideView {
 
     if (cancelled) { return; }
 
+    // Focal tier complete — tell the webview to settle the layout once.
+    panel.webview.postMessage({ command: 'activeDone', seqId });
+
     // ── Inactive tier — one neighbour at a time ──────────────────────────────
     for (const neighborUri of inactiveQueue) {
       if (cancelled) { break; }
@@ -160,6 +163,10 @@ export class GraphSideView {
         },
         () => cancelled
       );
+    }
+
+    if (!cancelled) {
+      panel.webview.postMessage({ command: 'buildDone', seqId });
     }
   }
 
@@ -244,6 +251,8 @@ export class GraphSideView {
     let buildRootId = null;           // id the current active build's neighbours hang off
     let hoverNode = null;
     let dpr = 1, viewW = 0, viewH = 0;
+    let lastFileUri = null;           // last editor shown (persisted) — Reset returns here
+    let building = false;             // a build is streaming; layout is deferred until it ends
 
     const X_GAP = 175, LEVEL_Y = 210, MIN_DIST = 96, NODE_R = 16;
 
@@ -257,6 +266,7 @@ export class GraphSideView {
         activeId = s.activeId || null;
         if (s.view) { view = s.view; }
       }
+      if (s && s.lastFileUri) { lastFileUri = s.lastFileUri; }
     })();
 
     let saveTimer = null;
@@ -264,7 +274,7 @@ export class GraphSideView {
       if (saveTimer) { return; }
       saveTimer = setTimeout(() => {
         saveTimer = null;
-        vscode.setState({ nodes: [...nodeMap.values()], edges, activeId, view });
+        vscode.setState({ nodes: [...nodeMap.values()], edges, activeId, view, lastFileUri });
       }, 250);
     }
 
@@ -533,7 +543,8 @@ export class GraphSideView {
     }
 
     function updateStatus(stageDots) {
-      statusEl.textContent = nodeMap.size + ' classes · ' + edges.length + ' relationships' + (stageDots || '');
+      const base = nodeMap.size + ' classes · ' + edges.length + ' relationships';
+      statusEl.textContent = base + (building ? ' · loading…' : (stageDots || ''));
     }
 
     // ── focus / build orchestration ────────────────────────────────────────────
@@ -590,12 +601,31 @@ export class GraphSideView {
         return;
       }
 
-      if (msg.command === 'activeFile') { focusFile(msg.uri); return; }
+      if (msg.command === 'activeFile') {
+        lastFileUri = msg.uri; scheduleSave();
+        focusFile(msg.uri); return;
+      }
+
+      // The focal (active) tier finished streaming — run the force layout once so
+      // it settles smoothly instead of shaking on every incoming class.
+      if (msg.command === 'activeDone') {
+        if (msg.seqId !== currentSeqId) { return; }
+        kickSim(1);
+        return;
+      }
+      // The whole build (incl. the faint inactive neighbours) finished.
+      if (msg.command === 'buildDone') {
+        if (msg.seqId !== currentSeqId) { return; }
+        building = false;
+        updateStatus();
+        return;
+      }
 
       if (msg.command === 'stage') {
         // Stale detection: lock onto seqId from the first active-center stage.
         if (msg.tier === 'active' && msg.stage === 'center') {
           currentSeqId = msg.seqId;
+          building = true;
           // New build started — downgrade all existing nodes to inactive so the
           // active tier is rebuilt cleanly from the new centre outward.
           for (const n of nodeMap.values()) { n.tier = 'inactive'; n.expanded = false; }
@@ -653,8 +683,8 @@ export class GraphSideView {
 
         const dots = { center: '·', dependencies: '··', callers: '···', siblings: '····' };
         updateStatus(dots[msg.stage] || '');
-        // New geometry arrived — let the force layout settle it without overlap.
-        kickSim(msg.stage === 'center' ? 0.5 : 1);
+        // Nodes appear at their seeded positions as they stream in; the force layout
+        // is deferred to 'activeDone' so the graph settles once, not on every class.
         draw();
         scheduleSave();
         return;
@@ -728,13 +758,20 @@ export class GraphSideView {
 
     btnReset.addEventListener('click', () => {
       nodeMap.clear(); edges = []; edgeKeys.clear(); activeId = null; hoverNode = null;
-      buildRootId = null; currentSeqId = -1;
-      placeholderEl.style.display = 'flex';
-      placeholderMsg.textContent = 'Building graph…';
-      statusEl.textContent = '';
+      buildRootId = null; currentSeqId = -1; building = false;
+      sim.active = false; sim.alpha = 0; anim = null;
       vscode.setState(null);
+      placeholderEl.style.display = 'flex';
+      statusEl.textContent = '';
       draw();
-      vscode.postMessage({ command: 'requestBuildActive' });
+      // Reset returns to the last editor we showed, not whatever happens to be
+      // focused now (the graph panel itself has no active text editor).
+      if (lastFileUri) {
+        placeholderMsg.textContent = 'Building graph…';
+        requestBuild(lastFileUri);
+      } else {
+        placeholderMsg.textContent = 'Open a Java class to explore its graph';
+      }
     });
 
     new MutationObserver(() => draw()).observe(document.body, {
