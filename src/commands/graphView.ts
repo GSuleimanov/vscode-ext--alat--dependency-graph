@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
-import { buildFocusedGraph } from '../graph/data/focusedGraphBuilder';
+import { buildFocusedGraph, buildTraverseExpansion } from '../graph/data/focusedGraphBuilder';
+import { FocusedGraphNode } from '../graph/data/focusedGraphTypes';
 import { providerForUri } from '../graph/lang/registry';
 
 // Side-effect import: registers language providers (java, python).
@@ -11,10 +12,10 @@ export class GraphSideView {
   private panel?: vscode.WebviewPanel;
   private cancelCurrent?: () => void;
   private javaReady = false;
+  private currentNodes: FocusedGraphNode[] = [];
 
   constructor(private readonly context: vscode.ExtensionContext) {
-    // Track active editor globally so graph updates whenever the user navigates,
-    // regardless of which panel has focus.
+    // Track active editor globally so graph updates whenever the user navigates.
     context.subscriptions.push(
       vscode.window.onDidChangeActiveTextEditor((editor) => {
         if (!this.panel?.visible) { return; }
@@ -74,12 +75,16 @@ export class GraphSideView {
           preserveFocus: false,
         });
       } else if (msg.command === 'ready') {
-        // Webview has initialised — sync Java readiness state immediately.
         panel.webview.postMessage({ command: 'javaReady', ready: this.javaReady });
         if (this.javaReady) {
           const uri = vscode.window.activeTextEditor?.document.uri;
           if (uri && providerForUri(uri.toString())) { void this.loadFocusedGraph(uri); }
         }
+      } else if (msg.command === 'traverse') {
+        void this.loadTraverseExpansion();
+      } else if (msg.command === 'traverseReset') {
+        const uri = vscode.window.activeTextEditor?.document.uri;
+        if (uri && providerForUri(uri.toString())) { void this.loadFocusedGraph(uri); }
       }
     }, undefined, this.context.subscriptions);
 
@@ -92,6 +97,7 @@ export class GraphSideView {
 
     panel.onDidDispose(() => {
       this.cancelCurrent?.();
+      this.currentNodes = [];
       this.panel = undefined;
     }, undefined, this.context.subscriptions);
 
@@ -103,15 +109,37 @@ export class GraphSideView {
     this.cancelCurrent?.();
     let cancelled = false;
     this.cancelCurrent = () => { cancelled = true; };
+    this.currentNodes = [];
 
     this.panel.webview.postMessage({ command: 'graphReset', name: uri.path.split('/').pop() });
 
     await buildFocusedGraph(
       uri,
       (update) => {
-        if (!cancelled) {
-          this.panel?.webview.postMessage({ command: 'graphStage', ...update });
+        if (cancelled) { return; }
+        if (update.stage === 'center') {
+          this.currentNodes = [update.node];
+        } else {
+          this.currentNodes = [...this.currentNodes, ...(update as { nodes: FocusedGraphNode[] }).nodes];
         }
+        this.panel?.webview.postMessage({ command: 'graphStage', ...update });
+      },
+      () => cancelled
+    );
+  }
+
+  private async loadTraverseExpansion(): Promise<void> {
+    if (!this.panel || this.currentNodes.length === 0) { return; }
+    this.cancelCurrent?.();
+    let cancelled = false;
+    this.cancelCurrent = () => { cancelled = true; };
+
+    await buildTraverseExpansion(
+      this.currentNodes,
+      (update) => {
+        if (cancelled) { return; }
+        this.currentNodes = [...this.currentNodes, ...(update as { nodes: FocusedGraphNode[] }).nodes];
+        this.panel?.webview.postMessage({ command: 'graphStage', ...update });
       },
       () => cancelled
     );
@@ -125,8 +153,9 @@ export class GraphSideView {
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Codenav Graph</title>
   <style>
+    html, body { margin: 0; padding: 0; }
     *, *::before, *::after { box-sizing: border-box; }
-    body { margin: 0; background: var(--vscode-editor-background); color: var(--vscode-editor-foreground);
+    body { background: var(--vscode-editor-background); color: var(--vscode-editor-foreground);
            font-family: var(--vscode-font-family); display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
     #cy { flex: 1; position: relative; min-height: 0; overflow: hidden; }
     canvas { display: block; position: absolute; inset: 0; }
@@ -143,7 +172,6 @@ export class GraphSideView {
     }
     .gbtn:hover { background: var(--vscode-toolbar-hoverBackground, #2a2d2e); border-color: rgba(128,128,128,0.6); }
     .gbtn.active { border-color: var(--vscode-focusBorder); color: var(--vscode-focusBorder); }
-    .gbtn.off { opacity: .4; }
 
     /* Placeholder / status bar */
     #status { padding: 4px 12px; font-size: 11px; color: var(--vscode-descriptionForeground);
@@ -173,38 +201,43 @@ export class GraphSideView {
       <div id="loadingBar" class="loading-bar" style="display:none"><i></i></div>
     </div>
     <div id="floatBtns">
-      <button id="btnTraverse" class="gbtn off" title="Show one extra level of callers and dependencies (coming soon)" disabled>Traverse</button>
+      <button id="btnTraverse" class="gbtn" title="Show one extra level of callers and dependencies">Traverse</button>
       <button id="btnRecenter" class="gbtn" title="Re-centre view on the active class">Recenter</button>
     </div>
   </div>
   <div id="status"></div>
   <script>
     const vscode = acquireVsCodeApi();
-    const canvas  = document.getElementById('canvas');
-    const ctx     = canvas.getContext('2d');
+    const canvas         = document.getElementById('canvas');
+    const ctx            = canvas.getContext('2d');
     const statusEl       = document.getElementById('status');
     const placeholderEl  = document.getElementById('placeholder');
     const placeholderMsg = document.getElementById('placeholderMsg');
     const loadingBarEl   = document.getElementById('loadingBar');
+    const btnTraverse    = document.getElementById('btnTraverse');
+    const btnRecenter    = document.getElementById('btnRecenter');
 
     // ── state ─────────────────────────────────────────────────────────────────
     let nodeMap = new Map();   // id → { ...FocusedGraphNode, x, y }
     let edges   = [];
-    let centerNodeId = null;
+    let centerNodeId   = null;
+    let traverseActive = false;
     let view    = { x: 0, y: 0, scale: 1 };
     let hoverNode = null;
     let dpr = 1, viewW = 0, viewH = 0;
 
     // ── layout ────────────────────────────────────────────────────────────────
-    const ROW_Y  = { caller: -240, sibling: 0, center: 0, dependency: 240 };
-    const X_GAP  = 170;
+    const ROW_Y = { caller2: -480, caller: -240, sibling: 0, center: 0, dependency: 240, dependency2: 480 };
+    const X_GAP = 170;
 
     function layoutNodes() {
-      const all     = [...nodeMap.values()];
-      const callers = all.filter(n => n.role === 'caller');
-      const deps    = all.filter(n => n.role === 'dependency');
-      const center  = all.find(n => n.role === 'center');
-      const siblings= all.filter(n => n.role === 'sibling');
+      const all      = [...nodeMap.values()];
+      const callers2 = all.filter(n => n.role === 'caller2');
+      const callers  = all.filter(n => n.role === 'caller');
+      const deps     = all.filter(n => n.role === 'dependency');
+      const deps2    = all.filter(n => n.role === 'dependency2');
+      const center   = all.find(n => n.role === 'center');
+      const siblings = all.filter(n => n.role === 'sibling');
 
       function placeRow(group, y) {
         const total = group.length;
@@ -214,8 +247,10 @@ export class GraphSideView {
         });
       }
 
-      placeRow(callers, ROW_Y.caller);
-      placeRow(deps,    ROW_Y.dependency);
+      placeRow(callers2, ROW_Y.caller2);
+      placeRow(callers,  ROW_Y.caller);
+      placeRow(deps,     ROW_Y.dependency);
+      placeRow(deps2,    ROW_Y.dependency2);
 
       if (center) {
         const half = Math.floor(siblings.length / 2);
@@ -254,7 +289,6 @@ export class GraphSideView {
       T = {
         fill:       cssVar('--vscode-button-background', '#0e639c'),
         fillFocus:  cssVar('--vscode-charts-green', '#4ec9b0'),
-        fillSib:    cssVar('--vscode-button-background', '#0e639c'),
         text:       cssVar('--vscode-foreground', '#cccccc'),
         glyphText:  cssVar('--vscode-button-foreground', '#ffffff'),
         border:     cssVar('--vscode-panel-border', '#80808060'),
@@ -288,17 +322,19 @@ export class GraphSideView {
 
     function drawNode(n) {
       const s = toScreen(n);
-      const isCenter  = n.role === 'center';
-      const isSibling = n.role === 'sibling';
-      const isHover   = n === hoverNode;
-      const r = NODE_R + (isHover ? 3 : 0);
+      const isCenter   = n.role === 'center';
+      const isSibling  = n.role === 'sibling';
+      const isTraverse = n.role === 'caller2' || n.role === 'dependency2';
+      const isHover    = n === hoverNode;
+      const r = (NODE_R - (isTraverse ? 3 : 0)) + (isHover ? 3 : 0);
+      const alpha = isSibling ? 0.35 : (isTraverse ? 0.55 : 1);
 
-      ctx.globalAlpha = isSibling ? 0.35 : 1;
+      ctx.globalAlpha = alpha;
 
       if (isHover) {
         ctx.beginPath(); ctx.arc(s.x, s.y, r+5, 0, Math.PI*2);
         ctx.fillStyle = T.fill; ctx.globalAlpha = 0.18; ctx.fill();
-        ctx.globalAlpha = isSibling ? 0.35 : 1;
+        ctx.globalAlpha = alpha;
       }
 
       ctx.beginPath(); ctx.arc(s.x, s.y, r, 0, Math.PI*2);
@@ -324,7 +360,7 @@ export class GraphSideView {
         ctx.fillStyle = T.text;
         ctx.font = (isCenter ? 'bold ' : '') + '11px var(--vscode-font-family)';
         ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
-        ctx.globalAlpha = isSibling ? 0.35 : 1;
+        ctx.globalAlpha = alpha;
         ctx.fillText(n.name, 0, 0);
         ctx.restore();
       }
@@ -334,7 +370,7 @@ export class GraphSideView {
         ctx.globalAlpha = 1;
         ctx.font = 'bold 12px var(--vscode-font-family)';
         const tw = ctx.measureText(n.name).width;
-        const px=7, py=4, bw=tw+px*2, bh=20;
+        const px=7, bw=tw+px*2, bh=20;
         const bx=s.x-bw/2, by=s.y-r-10-bh;
         ctx.fillStyle = T.labelBg;
         ctx.beginPath(); ctx.roundRect(bx,by,bw,bh,4); ctx.fill();
@@ -367,15 +403,19 @@ export class GraphSideView {
       const a = nodeMap.get(e.from), b = nodeMap.get(e.to);
       if (!a || !b) { return; }
       const A = toScreen(a), B = toScreen(b);
+      const isTraverseEdge = (a.role === 'caller2' || a.role === 'dependency2' ||
+                              b.role === 'caller2' || b.role === 'dependency2');
       ctx.strokeStyle = T.edge[e.kind] ?? T.edge.uses;
       ctx.fillStyle   = T.edge[e.kind] ?? T.edge.uses;
-      ctx.lineWidth = 1.2; ctx.globalAlpha = 0.7;
+      ctx.lineWidth = 1.2; ctx.globalAlpha = isTraverseEdge ? 0.4 : 0.7;
 
       const ux0=B.x-A.x, uy0=B.y-A.y, L=Math.hypot(ux0,uy0)||1;
       const ux=ux0/L, uy=uy0/L;
       const HEAD=9;
-      const start={ x: A.x+ux*(NODE_R+1), y: A.y+uy*(NODE_R+1) };
-      const tip  ={ x: B.x-ux*(NODE_R+1.5), y: B.y-uy*(NODE_R+1.5) };
+      const rA = NODE_R - ((a.role==='caller2'||a.role==='dependency2') ? 3 : 0);
+      const rB = NODE_R - ((b.role==='caller2'||b.role==='dependency2') ? 3 : 0);
+      const start={ x: A.x+ux*(rA+1), y: A.y+uy*(rA+1) };
+      const tip  ={ x: B.x-ux*(rB+1.5), y: B.y-uy*(rB+1.5) };
 
       const seed=edgeSeed(e.from,e.to);
       const bowMag=(Math.hypot(tip.x-start.x,tip.y-start.y)/2)*Math.tan((3+(seed%8))*Math.PI/180)*((seed&1)?1:-1);
@@ -398,14 +438,15 @@ export class GraphSideView {
 
     function drawRowLabels() {
       if (!nodeMap.size) { return; }
-      const hasCallers = [...nodeMap.values()].some(n => n.role === 'caller');
-      const hasDeps    = [...nodeMap.values()].some(n => n.role === 'dependency');
+      const all = [...nodeMap.values()];
       ctx.font = '10px var(--vscode-font-family)';
       ctx.fillStyle = T.text; ctx.globalAlpha = 0.35;
       ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
-      const labelX = 8;
-      if (hasCallers) { ctx.fillText('Callers',      labelX, ROW_Y.caller     *view.scale+view.y); }
-      if (hasDeps)    { ctx.fillText('Dependencies', labelX, ROW_Y.dependency *view.scale+view.y); }
+      const lx = 8;
+      if (all.some(n => n.role === 'caller2'))    { ctx.fillText('Callers ›',     lx, ROW_Y.caller2     *view.scale+view.y); }
+      if (all.some(n => n.role === 'caller'))      { ctx.fillText('Callers',       lx, ROW_Y.caller      *view.scale+view.y); }
+      if (all.some(n => n.role === 'dependency'))  { ctx.fillText('Dependencies',  lx, ROW_Y.dependency  *view.scale+view.y); }
+      if (all.some(n => n.role === 'dependency2')) { ctx.fillText('Dependencies ›',lx, ROW_Y.dependency2 *view.scale+view.y); }
       ctx.globalAlpha = 1;
     }
 
@@ -414,7 +455,11 @@ export class GraphSideView {
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.clearRect(0, 0, viewW, viewH);
       edges.forEach(drawEdge);
-      const ordered = [...nodeMap.values()].sort((a,b) => (a.role==='center'?1:0)-(b.role==='center'?1:0));
+      // Paint center on top; traverse nodes below everything else.
+      const ordered = [...nodeMap.values()].sort((a, b) => {
+        const rank = r => r==='center' ? 3 : (r==='caller'||r==='dependency') ? 2 : (r==='sibling') ? 1 : 0;
+        return rank(a.role) - rank(b.role);
+      });
       const withHover = hoverNode ? [...ordered.filter(n=>n!==hoverNode), hoverNode] : ordered;
       withHover.forEach(drawNode);
       drawRowLabels();
@@ -438,6 +483,8 @@ export class GraphSideView {
 
       if (msg.command === 'graphReset') {
         nodeMap.clear(); edges = []; centerNodeId = null; hoverNode = null;
+        traverseActive = false;
+        btnTraverse.classList.remove('active');
         loadingBarEl.style.display  = 'none';
         placeholderEl.style.display = 'flex';
         placeholderMsg.textContent  = 'Building graph for ' + msg.name + '…';
@@ -449,6 +496,8 @@ export class GraphSideView {
 
       if (msg.command === 'graphIdle') {
         nodeMap.clear(); edges = []; centerNodeId = null; hoverNode = null;
+        traverseActive = false;
+        btnTraverse.classList.remove('active');
         placeholderEl.style.display = 'flex';
         placeholderMsg.textContent = 'Open a Java class to explore its graph';
         statusEl.textContent = '';
@@ -473,8 +522,9 @@ export class GraphSideView {
         if (isFirst || msg.stage === 'center') { fitView(); }
 
         const nCount = nodeMap.size, eCount = edges.length;
-        const stages = { center:'·', dependencies:'··', callers:'···', siblings:'····' };
-        statusEl.textContent = nCount + ' classes · ' + eCount + ' relationships' + (stages[msg.stage] || '');
+        const dots = { center:'·', dependencies:'··', callers:'···', siblings:'····',
+                       'traverse-callers':'·····', 'traverse-deps':'······' };
+        statusEl.textContent = nCount + ' classes · ' + eCount + ' relationships' + (dots[msg.stage] || '');
 
         draw();
         return;
@@ -488,7 +538,8 @@ export class GraphSideView {
       const nodes = [...nodeMap.values()];
       for (let i=nodes.length-1;i>=0;i--) {
         const s = toScreen(nodes[i]);
-        if ((px-s.x)**2+(py-s.y)**2 <= (NODE_R+4)**2) { return nodes[i]; }
+        const r = NODE_R - ((nodes[i].role==='caller2'||nodes[i].role==='dependency2') ? 3 : 0);
+        if ((px-s.x)**2+(py-s.y)**2 <= (r+4)**2) { return nodes[i]; }
       }
       return null;
     }
@@ -533,8 +584,15 @@ export class GraphSideView {
       draw();
     }, { passive: false });
 
-    document.getElementById('btnRecenter').addEventListener('click', () => {
+    btnRecenter.addEventListener('click', () => {
       if (centerNodeId) { const n=nodeMap.get(centerNodeId); if(n){fitView();draw();} }
+    });
+
+    btnTraverse.addEventListener('click', () => {
+      if (nodeMap.size === 0) { return; }
+      traverseActive = !traverseActive;
+      btnTraverse.classList.toggle('active', traverseActive);
+      vscode.postMessage({ command: traverseActive ? 'traverse' : 'traverseReset' });
     });
 
     new MutationObserver(() => draw()).observe(document.body, {

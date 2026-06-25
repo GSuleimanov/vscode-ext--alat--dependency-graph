@@ -1,6 +1,6 @@
 // Pure types for the focused graph view. No VSCode imports — safe to import anywhere.
 
-export type NodeRole = 'center' | 'dependency' | 'caller' | 'sibling';
+export type NodeRole = 'center' | 'dependency' | 'caller' | 'sibling' | 'caller2' | 'dependency2';
 export type FocusedEdgeKind = 'extends' | 'implements' | 'uses' | 'calls';
 
 export interface FocusedGraphNode {
@@ -20,11 +20,14 @@ export interface FocusedGraphEdge {
 }
 
 // Progressive update emitted by focusedGraphBuilder — one per stage.
-// Stages arrive in order: center → dependencies → callers → siblings.
+// Base stages arrive in order: center → dependencies → callers → siblings.
+// Traverse stages (optional, on demand): traverse-callers → traverse-deps.
 export type GraphStageUpdate =
-  | { stage: 'center';       node: FocusedGraphNode }
-  | { stage: 'dependencies'; nodes: FocusedGraphNode[]; edges: FocusedGraphEdge[] }
-  | { stage: 'callers';      nodes: FocusedGraphNode[]; edges: FocusedGraphEdge[] }
-  | { stage: 'siblings';     nodes: FocusedGraphNode[]; edges: FocusedGraphEdge[] };
+  | { stage: 'center';           node: FocusedGraphNode }
+  | { stage: 'dependencies';     nodes: FocusedGraphNode[]; edges: FocusedGraphEdge[] }
+  | { stage: 'callers';          nodes: FocusedGraphNode[]; edges: FocusedGraphEdge[] }
+  | { stage: 'siblings';         nodes: FocusedGraphNode[]; edges: FocusedGraphEdge[] }
+  | { stage: 'traverse-callers'; nodes: FocusedGraphNode[]; edges: FocusedGraphEdge[] }
+  | { stage: 'traverse-deps';    nodes: FocusedGraphNode[]; edges: FocusedGraphEdge[] };
 
 export type StageCallback = (update: GraphStageUpdate) => void;

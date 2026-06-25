@@ -233,3 +233,85 @@ export async function buildFocusedGraph(
     onStage({ stage: 'siblings', nodes: siblingNodes, edges: [] });
   }
 }
+
+// ── traverse expansion ──────────────────────────────────────────────────────────
+// Called on demand when the user activates the Traverse button. Expands one extra
+// hop outward: who calls the existing callers, and what do the existing deps depend on.
+
+export async function buildTraverseExpansion(
+  existingNodes: FocusedGraphNode[],
+  onStage: StageCallback,
+  isCancelled: Cancelled = () => false
+): Promise<void> {
+  const existingIds = new Set(existingNodes.map(n => n.id));
+
+  // ── Level-2 callers ──────────────────────────────────────────────────────────
+  const callerNodes = existingNodes.filter(n => n.role === 'caller');
+  const caller2Nodes: FocusedGraphNode[] = [];
+  const caller2Edges: FocusedGraphEdge[] = [];
+  const caller2Seen = new Set<string>();
+
+  await Promise.all(callerNodes.map(async (callerNode) => {
+    if (isCancelled()) { return; }
+    const callerUri = vscode.Uri.parse(callerNode.uri);
+    const text = await readFileText(callerUri);
+    if (isCancelled()) { return; }
+    const namePos = findNamePosition(text, callerNode.name, callerNode.line);
+    const refs = await execLocs('vscode.executeReferenceProvider', callerUri, namePos);
+    if (isCancelled()) { return; }
+
+    const refUris = [...new Set(
+      refs.filter(r => isWorkspace(r.uri) && r.uri.toString() !== callerNode.uri)
+          .map(r => r.uri.toString())
+    )];
+
+    for (const refUri of refUris) {
+      const parsed = await parseSingleFile(vscode.Uri.parse(refUri));
+      const type = parsed.find(p => !p.tags?.includes('test'));
+      if (!type) { continue; }
+      const id = nodeId(refUri, type.line);
+      if (caller2Seen.has(id) || existingIds.has(id)) { continue; }
+      caller2Seen.add(id);
+      caller2Nodes.push(toNode(type, refUri, 'caller2'));
+      caller2Edges.push({ from: id, to: callerNode.id, kind: 'calls' });
+    }
+  }));
+
+  if (isCancelled()) { return; }
+  if (caller2Nodes.length > 0) {
+    onStage({ stage: 'traverse-callers', nodes: caller2Nodes, edges: caller2Edges });
+  }
+
+  // ── Level-2 dependencies ─────────────────────────────────────────────────────
+  const depNodes = existingNodes.filter(n => n.role === 'dependency');
+  const dep2Nodes: FocusedGraphNode[] = [];
+  const dep2Edges: FocusedGraphEdge[] = [];
+  const dep2Seen = new Set<string>();
+
+  await Promise.all(depNodes.map(async (depNode) => {
+    if (isCancelled()) { return; }
+    const depUri = vscode.Uri.parse(depNode.uri);
+    const depParsed = await parseSingleFile(depUri);
+    const depType = depParsed.find(p => p.name === depNode.name);
+    if (!depType) { return; }
+
+    await Promise.all(depType.fieldTypes.map(async (simpleName) => {
+      if (isCancelled()) { return; }
+      const fieldUri = await resolveTypeUri(simpleName);
+      if (!fieldUri || !isWorkspace(fieldUri)) { return; }
+      const fieldParsed = await parseSingleFile(fieldUri);
+      const fieldType = fieldParsed.find(p => p.name === simpleName);
+      if (!fieldType) { return; }
+      const id = nodeId(fieldUri.toString(), fieldType.line);
+      if (dep2Seen.has(id) || existingIds.has(id)) { return; }
+      dep2Seen.add(id);
+      dep2Nodes.push(toNode(fieldType, fieldUri.toString(), 'dependency2'));
+      dep2Edges.push({ from: depNode.id, to: id, kind: 'uses' });
+    }));
+  }));
+
+  if (isCancelled()) { return; }
+  if (dep2Nodes.length > 0) {
+    onStage({ stage: 'traverse-deps', nodes: dep2Nodes, edges: dep2Edges });
+  }
+}
