@@ -22,49 +22,16 @@
     "Other"
   ],
   "activationEvents": [
-    "onLanguage:java",
-    "onView:codenav.referencesView"
+    "onLanguage:java"
   ],
   "main": "./dist/extension.js",
   "contributes": {
     "commands": [
       {
-        "command": "codenav.findReferences",
-        "title": "Find References",
-        "category": "Codenav"
-      },
-      {
         "command": "codenav.openGraph",
         "title": "Open Project Graph",
         "category": "Codenav",
         "icon": "$(type-hierarchy)"
-      }
-    ],
-    "menus": {
-      "view/title": [
-        {
-          "command": "codenav.openGraph",
-          "when": "view == codenav.referencesView",
-          "group": "navigation"
-        }
-      ]
-    },
-    "views": {
-      "panel": [
-        {
-          "type": "webview",
-          "id": "codenav.referencesView",
-          "name": "Codenav References",
-          "icon": "$(list-tree)"
-        }
-      ]
-    },
-    "keybindings": [
-      {
-        "command": "codenav.findReferences",
-        "key": "shift+alt+f12",
-        "mac": "shift+alt+f12",
-        "when": "editorLangId == java && editorTextFocus"
       }
     ],
     "configuration": {

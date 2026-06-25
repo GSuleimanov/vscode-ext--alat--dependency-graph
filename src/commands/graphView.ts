@@ -19,6 +19,7 @@ export class GraphSideView {
   private panel?: vscode.WebviewPanel;
   private cancelCurrent?: () => void;
   private javaReady = false;
+  private buildSeq = 0;
 
   constructor(private readonly context: vscode.ExtensionContext) {
     context.subscriptions.push(
@@ -41,13 +42,6 @@ export class GraphSideView {
     if (!this.panel) { return; }
     this.panel.webview.postMessage({ command: 'javaReady', ready });
     if (ready) { this.postActiveFile(); }
-  }
-
-  /** Called by filteredPeek when a symbol is peeked — bring that class into focus. */
-  focusUri(uriStr: string): void {
-    if (!providerForUri(uriStr)) { return; }
-    this.ensurePanel();
-    this.postActiveFile(vscode.Uri.parse(uriStr));
   }
 
   private postActiveFile(uriOverride?: vscode.Uri): void {
@@ -80,11 +74,11 @@ export class GraphSideView {
           if (this.javaReady) { this.postActiveFile(); }
           break;
         case 'requestBuild':
-          if (msg.uri) { void this.buildFor(vscode.Uri.parse(msg.uri)); }
+          if (msg.uri) { void this.buildTwoTier(vscode.Uri.parse(msg.uri)); }
           break;
         case 'requestBuildActive': {
           const uri = vscode.window.activeTextEditor?.document.uri;
-          if (uri && providerForUri(uri.toString())) { void this.buildFor(uri); }
+          if (uri && providerForUri(uri.toString())) { void this.buildTwoTier(uri); }
           break;
         }
         case 'navigate':
@@ -114,24 +108,59 @@ export class GraphSideView {
     return panel;
   }
 
-  /** Expand one class: stream its neighbourhood to the webview, tagged with the file
-   *  it belongs to so the webview can discard results from a superseded build. */
-  private async buildFor(uri: vscode.Uri): Promise<void> {
+  /**
+   * Two-tier build:
+   *   Active tier  — center + its direct callers + deps (fully opaque)
+   *   Inactive tier — each active neighbour's own callers + deps (transparent)
+   *
+   * Stages are tagged with a seqId so the webview can discard stale messages from
+   * a superseded build without any race between cancelled and incoming messages.
+   */
+  private async buildTwoTier(centerUri: vscode.Uri): Promise<void> {
     if (!this.panel) { return; }
     this.cancelCurrent?.();
     let cancelled = false;
     this.cancelCurrent = () => { cancelled = true; };
-    const forUri = uri.toString();
+    const panel = this.panel;
+    const centerUriStr = centerUri.toString();
+    const seqId = ++this.buildSeq;
 
+    // URIs that belong to the active tier — skip them when building inactive.
+    const activeTierUris = new Set<string>([centerUriStr]);
+    const inactiveQueue: string[] = [];
+
+    // ── Active tier ─────────────────────────────────────────────────────────
     await buildFocusedGraph(
-      uri,
+      centerUri,
       (update) => {
-        if (!cancelled) {
-          this.panel?.webview.postMessage({ command: 'stage', forUri, ...update });
+        if (cancelled) { return; }
+        if ('nodes' in update) {
+          for (const n of update.nodes) {
+            if (!activeTierUris.has(n.uri)) {
+              activeTierUris.add(n.uri);
+              inactiveQueue.push(n.uri);
+            }
+          }
         }
+        panel.webview.postMessage({ command: 'stage', seqId, tier: 'active', forUri: centerUriStr, ...update });
       },
       () => cancelled
     );
+
+    if (cancelled) { return; }
+
+    // ── Inactive tier — one neighbour at a time ──────────────────────────────
+    for (const neighborUri of inactiveQueue) {
+      if (cancelled) { break; }
+      await buildFocusedGraph(
+        vscode.Uri.parse(neighborUri),
+        (update) => {
+          if (cancelled) { return; }
+          panel.webview.postMessage({ command: 'stage', seqId, tier: 'inactive', forUri: neighborUri, ...update });
+        },
+        () => cancelled
+      );
+    }
   }
 
   private getHtml(): string {
@@ -211,8 +240,8 @@ export class GraphSideView {
     // transient
     let javaReady = false;
     let pendingActive = null;         // uri awaited until java is ready
-    let currentBuildUri = null;       // newest in-flight build; older stages ignored
-    let buildRootId = null;           // id the current build's neighbours hang off
+    let currentSeqId = -1;           // newest in-flight build seqId; older stages ignored
+    let buildRootId = null;           // id the current active build's neighbours hang off
     let hoverNode = null;
     let dpr = 1, viewW = 0, viewH = 0;
 
@@ -298,16 +327,16 @@ export class GraphSideView {
       }
       return { x, y };
     }
-    function placeNew(node, x, y) {
+    function placeNew(node, x, y, tier) {
       const spot = freeSpot(x, y);
-      nodeMap.set(node.id, { ...node, x: spot.x, y: spot.y, expanded: false });
+      nodeMap.set(node.id, { ...node, x: spot.x, y: spot.y, expanded: false, tier: tier || 'active' });
     }
-    function placeGroup(root, nodes, dirY) {
+    function placeGroup(root, nodes, dirY, tier) {
       const fresh = nodes.filter(n => !nodeMap.has(n.id));
       const total = fresh.length;
       fresh.forEach((n, i) => {
         const x = root.x + (total === 1 ? 0 : (i - (total - 1) / 2) * X_GAP);
-        placeNew(n, x, root.y + dirY);
+        placeNew(n, x, root.y + dirY, tier || 'active');
       });
     }
     function addEdge(e) {
@@ -353,10 +382,12 @@ export class GraphSideView {
       const isActive = n.id === activeId;
       const isHover  = n === hoverNode;
       const r = NODE_R + (isHover ? 3 : 0);
+      const baseAlpha = n.tier === 'inactive' ? 0.35 : 1.0;
+      ctx.globalAlpha = baseAlpha;
 
       if (isHover) {
         ctx.beginPath(); ctx.arc(s.x, s.y, r + 5, 0, Math.PI * 2);
-        ctx.fillStyle = T.fill; ctx.globalAlpha = 0.18; ctx.fill(); ctx.globalAlpha = 1;
+        ctx.fillStyle = T.fill; ctx.globalAlpha = 0.18 * baseAlpha; ctx.fill(); ctx.globalAlpha = baseAlpha;
       }
 
       ctx.beginPath(); ctx.arc(s.x, s.y, r, 0, Math.PI * 2);
@@ -395,6 +426,7 @@ export class GraphSideView {
         ctx.fillText(n.name, s.x, by + bh / 2);
         ctx.textBaseline = 'alphabetic';
       }
+      ctx.globalAlpha = 1;
     }
 
     function edgeSeed(from, to) {
@@ -406,9 +438,11 @@ export class GraphSideView {
       const a = nodeMap.get(e.from), b = nodeMap.get(e.to);
       if (!a || !b) { return; }
       const A = toScreen(a), B = toScreen(b);
+      const inactiveEdge = (a.tier === 'inactive' || b.tier === 'inactive');
       ctx.strokeStyle = T.edge[e.kind] || T.edge.uses;
       ctx.fillStyle   = T.edge[e.kind] || T.edge.uses;
-      ctx.lineWidth = 1.2; ctx.globalAlpha = 0.7;
+      ctx.lineWidth = inactiveEdge ? 0.7 : 1.2;
+      ctx.globalAlpha = inactiveEdge ? 0.18 : 0.7;
 
       const ux0 = B.x - A.x, uy0 = B.y - A.y, L = Math.hypot(ux0, uy0) || 1;
       const ux = ux0 / L, uy = uy0 / L, HEAD = 9;
@@ -464,7 +498,6 @@ export class GraphSideView {
       scheduleSave();
     }
     function requestBuild(uri) {
-      currentBuildUri = uri;
       if (nodeMap.size === 0) {
         placeholderEl.style.display = 'flex';
         loadingBarEl.style.display = 'none';
@@ -475,12 +508,14 @@ export class GraphSideView {
     function focusFile(uri) {
       if (!javaReady) { pendingActive = uri; return; }
       const n = findByUri(uri);
-      if (n) { setActive(n); if (!n.expanded) { requestBuild(uri); } }
-      else   { requestBuild(uri); }
+      // If already the active-and-expanded centre, just pan — no rebuild needed.
+      if (n && n.id === activeId && n.expanded) { setActive(n); }
+      else { requestBuild(uri); }
     }
     function activateNode(n) {
+      if (n.id === activeId) { animateToNode(n); return; } // already centre, just pan
       setActive(n);
-      if (!n.expanded) { requestBuild(n.uri); }
+      requestBuild(n.uri); // always rebuild to recenter the two-tier view
     }
 
     // ── message handling ───────────────────────────────────────────────────────
@@ -504,31 +539,62 @@ export class GraphSideView {
       if (msg.command === 'activeFile') { focusFile(msg.uri); return; }
 
       if (msg.command === 'stage') {
-        if (msg.forUri && msg.forUri !== currentBuildUri) { return; }   // stale build
+        // Stale detection: lock onto seqId from the first active-center stage.
+        if (msg.tier === 'active' && msg.stage === 'center') {
+          currentSeqId = msg.seqId;
+          // New build started — downgrade all existing nodes to inactive so the
+          // active tier is rebuilt cleanly from the new centre outward.
+          for (const n of nodeMap.values()) { n.tier = 'inactive'; n.expanded = false; }
+        } else if (msg.seqId !== currentSeqId) {
+          return;  // stale stage from a superseded build
+        }
         placeholderEl.style.display = 'none';
 
-        if (msg.stage === 'center') {
-          let node = nodeMap.get(msg.node.id);
-          if (!node) {
-            if (nodeMap.size === 0) {
-              // First class ever: anchor at origin, centre the camera on it.
-              nodeMap.set(msg.node.id, { ...msg.node, x: 0, y: 0, expanded: true });
-              view = { x: viewW / 2, y: viewH / 2, scale: 1 };
+        if (msg.tier === 'active') {
+          if (msg.stage === 'center') {
+            let node = nodeMap.get(msg.node.id);
+            if (!node) {
+              if (nodeMap.size === 0) {
+                nodeMap.set(msg.node.id, { ...msg.node, x: 0, y: 0, expanded: true, tier: 'active' });
+                view = { x: viewW / 2, y: viewH / 2, scale: 1 };
+              } else {
+                const c = cameraCenterGraph();
+                placeNew(msg.node, c.x, c.y, 'active');
+              }
+              node = nodeMap.get(msg.node.id);
             } else {
-              const c = cameraCenterGraph();
-              placeNew(msg.node, c.x, c.y);
+              node.tier = 'active';
             }
-            node = nodeMap.get(msg.node.id);
+            node.expanded = true;
+            buildRootId = node.id;
+            setActive(node);
+          } else {
+            const root = nodeMap.get(buildRootId);
+            if (!root) { return; }
+            const dirY = msg.stage === 'callers' ? -LEVEL_Y : msg.stage === 'dependencies' ? LEVEL_Y : 0;
+            // Upgrade existing nodes and place any new ones.
+            for (const n of (msg.nodes || [])) {
+              const ex = nodeMap.get(n.id);
+              if (ex) { ex.tier = 'active'; }
+            }
+            placeGroup(root, msg.nodes || [], dirY, 'active');
+            for (const e of (msg.edges || [])) { addEdge(e); }
           }
-          node.expanded = true;
-          buildRootId = node.id;
-          setActive(node);
-        } else {
-          const root = nodeMap.get(buildRootId);
-          if (!root) { return; }
-          const dirY = msg.stage === 'callers' ? -LEVEL_Y : msg.stage === 'dependencies' ? LEVEL_Y : 0;
-          placeGroup(root, msg.nodes, dirY);
-          for (const e of msg.edges) { addEdge(e); }
+        } else if (msg.tier === 'inactive') {
+          if (msg.stage === 'center') {
+            // The centre of an inactive build is already on the map as an active node.
+            // Mark it expanded so clicks know its neighbourhood is loaded.
+            const ex = nodeMap.get(msg.node?.id);
+            if (ex) { ex.expanded = true; }
+          } else {
+            // Place only nodes not already on the map (active nodes are never downgraded).
+            const root = findByUri(msg.forUri);
+            if (!root) { return; }
+            const dirY = msg.stage === 'callers' ? -LEVEL_Y : msg.stage === 'dependencies' ? LEVEL_Y : 0;
+            const fresh = (msg.nodes || []).filter(n => !nodeMap.has(n.id));
+            placeGroup(root, fresh, dirY, 'inactive');
+            for (const e of (msg.edges || [])) { addEdge(e); }
+          }
         }
 
         const dots = { center: '·', dependencies: '··', callers: '···', siblings: '····' };
@@ -606,7 +672,7 @@ export class GraphSideView {
 
     btnReset.addEventListener('click', () => {
       nodeMap.clear(); edges = []; edgeKeys.clear(); activeId = null; hoverNode = null;
-      buildRootId = null; currentBuildUri = null;
+      buildRootId = null; currentSeqId = -1;
       placeholderEl.style.display = 'flex';
       placeholderMsg.textContent = 'Building graph…';
       statusEl.textContent = '';
