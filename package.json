@@ -31,7 +31,7 @@
         "command": "codenav.openGraph",
         "title": "Open Project Graph",
         "category": "Codenav",
-        "icon": "$(type-hierarchy)"
+        "icon": "$(circuit-board)"
       }
     ],
     "configuration": {

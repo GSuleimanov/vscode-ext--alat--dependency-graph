@@ -6,12 +6,15 @@ import { providerForUri } from '../graph/lang/registry';
 import '../graph/lang';
 
 /**
- * The graph is an editor panel backed by a persistent, accumulating map that the
- * webview owns: every class keeps its coordinates once placed (and survives reloads
- * via webview state). This extension side is a stateless build service — it never
- * forces a redraw. When the active editor changes it merely tells the webview which
- * file is now active; the webview pans to it if already on the map (no rebuild, no
- * flicker) or asks for a build only when the class is new or unexpanded.
+ * The graph is an editor panel whose map the webview owns. By default it is
+ * ephemeral: each selection shows only that class plus one hop around it, and the
+ * previous neighbourhood is discarded. A "Persist" toggle in the webview switches
+ * to an accumulating map where every visited class keeps its coordinates once
+ * placed. Either way the map survives reloads via webview state. This extension
+ * side is a stateless build service — it never forces a redraw. When the active
+ * editor changes it merely tells the webview which file is now active; the webview
+ * pans to it if already on the map (no rebuild, no flicker) or asks for a build
+ * only when the class is new or unexpanded.
  */
 export class GraphSideView {
   static readonly viewId = 'codenav.graphView';
@@ -65,6 +68,10 @@ export class GraphSideView {
       { enableScripts: true, retainContextWhenHidden: true }
     );
     this.panel = panel;
+    panel.iconPath = {
+      light: vscode.Uri.joinPath(this.context.extensionUri, 'images', 'graph-light.svg'),
+      dark: vscode.Uri.joinPath(this.context.extensionUri, 'images', 'graph-dark.svg'),
+    };
     panel.webview.html = this.getHtml();
 
     panel.webview.onDidReceiveMessage(async (msg) => {
@@ -84,10 +91,13 @@ export class GraphSideView {
         case 'navigate':
           if (msg.uri) {
             const doc = await vscode.workspace.openTextDocument(vscode.Uri.parse(msg.uri));
+            // Single click previews (italic, reused tab) and keeps focus on the
+            // graph; double click pins the tab and moves focus into the editor.
             await vscode.window.showTextDocument(doc, {
               viewColumn: vscode.ViewColumn.One,
               selection: new vscode.Range(msg.line ?? 0, 0, msg.line ?? 0, 0),
-              preserveFocus: false,
+              preview: msg.preview ?? false,
+              preserveFocus: !(msg.focus ?? true),
             });
           }
           break;
@@ -195,6 +205,12 @@ export class GraphSideView {
       transition: background .12s, border-color .12s, opacity .12s;
     }
     .gbtn:hover { background: var(--vscode-toolbar-hoverBackground, #2a2d2e); border-color: rgba(128,128,128,0.6); }
+    .gbtn.active {
+      background: var(--vscode-button-background, #0e639c);
+      color: var(--vscode-button-foreground, #ffffff);
+      border-color: var(--vscode-button-background, #0e639c);
+    }
+    .gbtn.active:hover { background: var(--vscode-button-hoverBackground, #1177bb); }
 
     #status { padding: 4px 12px; font-size: 11px; color: var(--vscode-descriptionForeground);
               border-top: 1px solid var(--vscode-panel-border); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -222,6 +238,7 @@ export class GraphSideView {
       <div id="loadingBar" class="loading-bar" style="display:none"><i></i></div>
     </div>
     <div id="floatBtns">
+      <button id="btnPersist" class="gbtn" title="Keep every visited class on the map instead of showing only the current selection">Persist</button>
       <button id="btnReset" class="gbtn" title="Clear the map and show only the current class">Reset</button>
     </div>
   </div>
@@ -235,6 +252,7 @@ export class GraphSideView {
     const placeholderMsg = document.getElementById('placeholderMsg');
     const loadingBarEl   = document.getElementById('loadingBar');
     const btnReset       = document.getElementById('btnReset');
+    const btnPersist     = document.getElementById('btnPersist');
 
     // ── persistent map (single source of truth) ────────────────────────────────
     // nodeMap: id -> { id,name,uri,line,kind,tags, x,y, expanded }
@@ -243,6 +261,10 @@ export class GraphSideView {
     let edgeKeys = new Set();         // 'from|to' — dedup directed pairs
     let activeId = null;
     let view = { x: 0, y: 0, scale: 1 };
+    // persist=false (default): each selection shows only that class + 1 hop, the
+    // previous neighbourhood is discarded. persist=true accumulates every visited
+    // class on a single growing map.
+    let persist = false;
 
     // transient
     let javaReady = false;
@@ -253,6 +275,8 @@ export class GraphSideView {
     let dpr = 1, viewW = 0, viewH = 0;
     let lastFileUri = null;           // last editor shown (persisted) — Reset returns here
     let building = false;             // a build is streaming; layout is deferred until it ends
+    let suppressActiveFor = null;     // uri we just opened ourselves — ignore its echo
+    let suppressTimer = null;
 
     const X_GAP = 175, LEVEL_Y = 210, MIN_DIST = 96, NODE_R = 16;
 
@@ -260,13 +284,16 @@ export class GraphSideView {
     (function restore() {
       const s = vscode.getState();
       if (s && Array.isArray(s.nodes) && s.nodes.length) {
-        for (const n of s.nodes) { nodeMap.set(n.id, n); }
+        // Clear any transient fade state captured mid-transition so a reload
+        // doesn't restore half-faded or about-to-be-removed nodes.
+        for (const n of s.nodes) { n.fade = 1; delete n.stale; nodeMap.set(n.id, n); }
         edges = Array.isArray(s.edges) ? s.edges : [];
         for (const e of edges) { edgeKeys.add(e.from + '|' + e.to); }
         activeId = s.activeId || null;
         if (s.view) { view = s.view; }
       }
       if (s && s.lastFileUri) { lastFileUri = s.lastFileUri; }
+      if (s && typeof s.persist === 'boolean') { persist = s.persist; }
     })();
 
     let saveTimer = null;
@@ -274,7 +301,7 @@ export class GraphSideView {
       if (saveTimer) { return; }
       saveTimer = setTimeout(() => {
         saveTimer = null;
-        vscode.setState({ nodes: [...nodeMap.values()], edges, activeId, view, lastFileUri });
+        vscode.setState({ nodes: [...nodeMap.values()], edges, activeId, view, lastFileUri, persist });
       }, 250);
     }
 
@@ -327,6 +354,7 @@ export class GraphSideView {
       for (let iter = 0; iter < 14; iter++) {
         let dx = 0, dy = 0, d = Infinity;
         for (const m of nodeMap.values()) {
+          if (m.stale) { continue; }   // leaving nodes don't reserve space
           const ex = x - m.x, ey = y - m.y, ed = Math.hypot(ex, ey);
           if (ed < d) { d = ed; dx = ex; dy = ey; }
         }
@@ -339,7 +367,8 @@ export class GraphSideView {
     }
     function placeNew(node, x, y, tier) {
       const spot = freeSpot(x, y);
-      nodeMap.set(node.id, { ...node, x: spot.x, y: spot.y, expanded: false, tier: tier || 'active' });
+      nodeMap.set(node.id, { ...node, x: spot.x, y: spot.y, expanded: false, tier: tier || 'active', fade: 0 });
+      kickFade();
     }
     function placeGroup(root, nodes, dirY, tier) {
       const fresh = nodes.filter(n => !nodeMap.has(n.id));
@@ -366,7 +395,7 @@ export class GraphSideView {
       if (!sim.active) { sim.active = true; requestAnimationFrame(simStep); }
     }
     function relaxOverlaps() {
-      const nodes = [...nodeMap.values()];
+      const nodes = [...nodeMap.values()].filter(n => !n.stale);
       for (let iter = 0; iter < 2; iter++) {
         for (let i = 0; i < nodes.length; i++) {
           for (let j = i + 1; j < nodes.length; j++) {
@@ -390,7 +419,7 @@ export class GraphSideView {
       // and is pulled toward horizontal alignment with it.
       for (const e of edges) {
         const a = nodeMap.get(e.from), b = nodeMap.get(e.to);
-        if (!a || !b) { continue; }
+        if (!a || !b || a.stale || b.stale) { continue; }   // leaving nodes don't pull layout
         const vy = ((b.y - a.y) - LEVEL_Y) * 0.5 * sim.alpha;
         if (a !== dragging) { a.y += vy; }
         if (b !== dragging) { b.y -= vy; }
@@ -402,6 +431,44 @@ export class GraphSideView {
       sim.alpha *= 0.92;
       draw();
       requestAnimationFrame(simStep);
+    }
+
+    // ── fade engine ──────────────────────────────────────────────────────────
+    // Every node eases its render opacity toward a target: 1 when it belongs to
+    // the current view, 0 when marked .stale (a removal candidate). New nodes
+    // start at fade 0 so they grow in; stale nodes shrink out — both over ~150ms.
+    // Stale nodes are also dropped from layout immediately (freeSpot/relaxOverlaps
+    // skip them) so they free their space at once, while rescued nodes keep their
+    // exact spot. Fully-faded stale nodes are deleted only once the build has
+    // finished (prunePending), so a node rescued mid-build is never lost.
+    const FADE_MS = 150;
+    let fadeRAF = null, lastFadeTs = 0, prunePending = false;
+    function kickFade() { if (!fadeRAF) { fadeRAF = requestAnimationFrame(fadeStep); } }
+    function fadeStep(ts) {
+      fadeRAF = null;
+      const dt = lastFadeTs ? Math.min(50, ts - lastFadeTs) : 16;
+      lastFadeTs = ts;
+      const rate = dt / FADE_MS;
+      let active = false, removed = false;
+      for (const n of nodeMap.values()) {
+        const target = n.stale ? 0 : 1;
+        if (n.fade == null) { n.fade = target; }
+        if (n.fade < target)      { n.fade = Math.min(target, n.fade + rate); active = true; }
+        else if (n.fade > target) { n.fade = Math.max(target, n.fade - rate); active = true; }
+      }
+      if (prunePending) {
+        for (const n of [...nodeMap.values()]) {
+          if (n.stale && n.fade <= 0.01) { nodeMap.delete(n.id); removed = true; }
+        }
+        if (![...nodeMap.values()].some(n => n.stale)) { prunePending = false; }
+      }
+      if (removed) {
+        edges = edges.filter(e => nodeMap.has(e.from) && nodeMap.has(e.to));
+        edgeKeys = new Set(edges.map(e => e.from + '|' + e.to));
+      }
+      draw();
+      if (active || prunePending) { kickFade(); }
+      else { lastFadeTs = 0; scheduleSave(); }
     }
 
     // ── camera animation ───────────────────────────────────────────────────────
@@ -446,7 +513,8 @@ export class GraphSideView {
       const r = NODE_R + (isHover ? 3 : 0);
       // Inactive nodes sit at 20% opacity; hovering any node floors it at 80% visible.
       const tierAlpha = n.tier === 'inactive' ? 0.20 : 1.0;
-      const baseAlpha = isHover ? Math.max(tierAlpha, 0.80) : tierAlpha;
+      const fade = n.fade != null ? n.fade : 1;   // <1 while a removed node dissolves
+      const baseAlpha = (isHover ? Math.max(tierAlpha, 0.80) : tierAlpha) * fade;
       ctx.globalAlpha = baseAlpha;
 
       if (isHover) {
@@ -498,15 +566,17 @@ export class GraphSideView {
       for (let i = 0; i < s.length; i++) { h = ((h << 5) + h + s.charCodeAt(i)) >>> 0; }
       return h;
     }
-    function drawEdge(e) {
+    function drawEdge(e, viaHover) {
       const a = nodeMap.get(e.from), b = nodeMap.get(e.to);
       if (!a || !b) { return; }
       const A = toScreen(a), B = toScreen(b);
       const inactiveEdge = (a.tier === 'inactive' || b.tier === 'inactive');
       ctx.strokeStyle = T.edge[e.kind] || T.edge.uses;
       ctx.fillStyle   = T.edge[e.kind] || T.edge.uses;
-      ctx.lineWidth = inactiveEdge ? 0.7 : 1.2;
-      ctx.globalAlpha = inactiveEdge ? 0.18 : 0.7;
+      // Inactive edges are only ever drawn while their node is hovered — show them
+      // clearly then rather than as the faint always-on lines they used to be.
+      ctx.lineWidth = inactiveEdge ? (viaHover ? 1.1 : 0.7) : 1.2;
+      ctx.globalAlpha = inactiveEdge ? (viaHover ? 0.6 : 0.18) : 0.7;
 
       const ux0 = B.x - A.x, uy0 = B.y - A.y, L = Math.hypot(ux0, uy0) || 1;
       const ux = ux0 / L, uy = uy0 / L, HEAD = 9;
@@ -535,7 +605,16 @@ export class GraphSideView {
       refreshTheme();
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.clearRect(0, 0, viewW, viewH);
-      edges.forEach(drawEdge);
+      // Arrows are drawn only between active elements. An inactive element's edges
+      // stay hidden until it is hovered, which reveals just that node's connections.
+      for (const e of edges) {
+        const a = nodeMap.get(e.from), b = nodeMap.get(e.to);
+        if (!a || !b) { continue; }
+        const bothActive = a.tier !== 'inactive' && b.tier !== 'inactive';
+        const touchesHover = hoverNode && (e.from === hoverNode.id || e.to === hoverNode.id);
+        if (bothActive) { drawEdge(e, false); }
+        else if (touchesHover) { drawEdge(e, true); }
+      }
       // Active node paints last (on top); hovered node above that.
       const ordered = [...nodeMap.values()].sort((a, b) => (a.id === activeId ? 1 : 0) - (b.id === activeId ? 1 : 0));
       const withHover = hoverNode ? [...ordered.filter(n => n !== hoverNode), hoverNode] : ordered;
@@ -562,6 +641,14 @@ export class GraphSideView {
       updateStatus();
       scheduleSave();
     }
+    // When a graph click opens a file, the editor becomes active and the extension
+    // echoes an 'activeFile' for it. We already handled focus + rebuild from the
+    // click, so swallow that one echo (timeout-guarded so it never goes stale).
+    function suppressActiveOnce(uri) {
+      suppressActiveFor = uri;
+      if (suppressTimer) { clearTimeout(suppressTimer); }
+      suppressTimer = setTimeout(() => { suppressActiveFor = null; suppressTimer = null; }, 600);
+    }
     function requestBuild(uri) {
       if (nodeMap.size === 0) {
         placeholderEl.style.display = 'flex';
@@ -577,12 +664,6 @@ export class GraphSideView {
       if (n && n.id === activeId && n.expanded) { setActive(n); }
       else { requestBuild(uri); }
     }
-    function activateNode(n) {
-      if (n.id === activeId) { animateToNode(n); return; } // already centre, just pan
-      setActive(n);
-      requestBuild(n.uri); // always rebuild to recenter the two-tier view
-    }
-
     // ── message handling ───────────────────────────────────────────────────────
     window.addEventListener('message', ({ data: msg }) => {
       if (msg.command === 'javaReady') {
@@ -603,6 +684,11 @@ export class GraphSideView {
 
       if (msg.command === 'activeFile') {
         lastFileUri = msg.uri; scheduleSave();
+        if (suppressActiveFor === msg.uri) {
+          suppressActiveFor = null;
+          if (suppressTimer) { clearTimeout(suppressTimer); suppressTimer = null; }
+          return;
+        }
         focusFile(msg.uri); return;
       }
 
@@ -617,6 +703,9 @@ export class GraphSideView {
       if (msg.command === 'buildDone') {
         if (msg.seqId !== currentSeqId) { return; }
         building = false;
+        // Anything still marked stale wasn't part of the new view — let it finish
+        // fading, then the engine deletes it.
+        if (!persist) { prunePending = true; kickFade(); }
         updateStatus();
         return;
       }
@@ -626,9 +715,20 @@ export class GraphSideView {
         if (msg.tier === 'active' && msg.stage === 'center') {
           currentSeqId = msg.seqId;
           building = true;
-          // New build started — downgrade all existing nodes to inactive so the
-          // active tier is rebuilt cleanly from the new centre outward.
-          for (const n of nodeMap.values()) { n.tier = 'inactive'; n.expanded = false; }
+          if (persist) {
+            // Persist mode — downgrade all existing nodes to inactive so the
+            // active tier is rebuilt cleanly from the new centre outward, but
+            // keep every previously visited class on the map.
+            for (const n of nodeMap.values()) { n.tier = 'inactive'; n.expanded = false; }
+          } else {
+            // Ephemeral mode (default) — don't wipe the map. Mark every node as a
+            // removal candidate; the incoming build "rescues" the ones the new
+            // neighbourhood shares (un-marking them, keeping their exact spot).
+            // Marked nodes immediately stop occupying layout space and fade out;
+            // whatever stays marked is deleted once the build completes.
+            for (const n of nodeMap.values()) { n.tier = 'inactive'; n.expanded = false; n.stale = true; }
+            kickFade();
+          }
         } else if (msg.seqId !== currentSeqId) {
           return;  // stale stage from a superseded build
         }
@@ -639,8 +739,9 @@ export class GraphSideView {
             let node = nodeMap.get(msg.node.id);
             if (!node) {
               if (nodeMap.size === 0) {
-                nodeMap.set(msg.node.id, { ...msg.node, x: 0, y: 0, expanded: true, tier: 'active' });
-                view = { x: viewW / 2, y: viewH / 2, scale: 1 };
+                nodeMap.set(msg.node.id, { ...msg.node, x: 0, y: 0, expanded: true, tier: 'active', fade: 0 });
+                view = { x: viewW / 2, y: viewH / 2, scale: view.scale || 1 };
+                kickFade();
               } else {
                 const c = cameraCenterGraph();
                 placeNew(msg.node, c.x, c.y, 'active');
@@ -649,6 +750,7 @@ export class GraphSideView {
             } else {
               node.tier = 'active';
             }
+            node.stale = false;   // rescued — fade engine eases it back to full
             node.expanded = true;
             buildRootId = node.id;
             setActive(node);
@@ -659,7 +761,7 @@ export class GraphSideView {
             // Upgrade existing nodes and place any new ones.
             for (const n of (msg.nodes || [])) {
               const ex = nodeMap.get(n.id);
-              if (ex) { ex.tier = 'active'; }
+              if (ex) { ex.tier = 'active'; ex.stale = false; }
             }
             placeGroup(root, msg.nodes || [], dirY, 'active');
             for (const e of (msg.edges || [])) { addEdge(e); }
@@ -669,12 +771,14 @@ export class GraphSideView {
             // The centre of an inactive build is already on the map as an active node.
             // Mark it expanded so clicks know its neighbourhood is loaded.
             const ex = nodeMap.get(msg.node?.id);
-            if (ex) { ex.expanded = true; }
+            if (ex) { ex.expanded = true; ex.stale = false; }
           } else {
             // Place only nodes not already on the map (active nodes are never downgraded).
             const root = findByUri(msg.forUri);
             if (!root) { return; }
             const dirY = msg.stage === 'callers' ? -LEVEL_Y : msg.stage === 'dependencies' ? LEVEL_Y : 0;
+            // Rescue any shared node this inactive neighbour reuses, then place the rest.
+            for (const n of (msg.nodes || [])) { const ex = nodeMap.get(n.id); if (ex) { ex.stale = false; } }
             const fresh = (msg.nodes || []).filter(n => !nodeMap.has(n.id));
             placeGroup(root, fresh, dirY, 'inactive');
             for (const e of (msg.edges || [])) { addEdge(e); }
@@ -685,6 +789,7 @@ export class GraphSideView {
         updateStatus(dots[msg.stage] || '');
         // Nodes appear at their seeded positions as they stream in; the force layout
         // is deferred to 'activeDone' so the graph settles once, not on every class.
+        kickFade();   // animate fade-in of new nodes / fade-back of rescued ones
         draw();
         scheduleSave();
         return;
@@ -693,7 +798,7 @@ export class GraphSideView {
 
     // ── interaction ────────────────────────────────────────────────────────────
     let dragging = null, panning = false, last = null, downPos = null, didMove = false;
-    let clickTimer = null, lastClickId = null, lastClickTime = 0;
+    let lastClickId = null, lastClickTime = 0;
 
     function pick(px, py) {
       const nodes = [...nodeMap.values()];
@@ -726,17 +831,22 @@ export class GraphSideView {
         const hit = pick(downPos.x, downPos.y);
         if (hit) {
           const now = Date.now();
-          if (lastClickId === hit.id && now - lastClickTime < 300) {
-            // double-click → open the file in the editor
-            if (clickTimer) { clearTimeout(clickTimer); clickTimer = null; }
-            lastClickId = null;
-            vscode.postMessage({ command: 'navigate', uri: hit.uri, line: hit.line });
-          } else {
-            // single-click → make active, pan, expand (deferred so a double-click can cancel)
-            lastClickId = hit.id; lastClickTime = now;
-            if (clickTimer) { clearTimeout(clickTimer); }
-            clickTimer = setTimeout(() => { clickTimer = null; activateNode(hit); }, 230);
-          }
+          const isDouble = (lastClickId === hit.id && now - lastClickTime < 300);
+          lastClickId = hit.id; lastClickTime = now;
+          const wasCentre = (hit.id === activeId && hit.expanded);
+
+          // Focus the node in the graph — pan instantly; promote it so it reads as
+          // the focus during the glide, before the rebuild fills its neighbourhood.
+          if (wasCentre) { animateToNode(hit); }
+          else { hit.tier = 'active'; hit.stale = false; kickFade(); setActive(hit); }
+
+          // Open the file too: single click previews (italic tab, focus stays on the
+          // graph) so you can keep clicking around; double click pins it and hands
+          // focus to the editor. We rebuild here, so swallow the editor's echo.
+          suppressActiveOnce(hit.uri);
+          vscode.postMessage({ command: 'navigate', uri: hit.uri, line: hit.line, preview: !isDouble, focus: isDouble });
+
+          if (!wasCentre) { requestBuild(hit.uri); }
         }
       }
       if (didMove && dragging) { scheduleSave(); }
@@ -756,10 +866,26 @@ export class GraphSideView {
       draw(); scheduleSave();
     }, { passive: false });
 
+    function reflectPersist() {
+      btnPersist.classList.toggle('active', persist);
+    }
+    btnPersist.addEventListener('click', () => {
+      persist = !persist;
+      reflectPersist();
+      scheduleSave();
+      // Turning persist OFF collapses the accumulated map back to just the active
+      // selection + 1 hop. Turning it ON keeps the current map and starts growing.
+      if (!persist) {
+        const active = activeId ? nodeMap.get(activeId) : null;
+        if (active) { requestBuild(active.uri); }
+      }
+    });
+
     btnReset.addEventListener('click', () => {
       nodeMap.clear(); edges = []; edgeKeys.clear(); activeId = null; hoverNode = null;
       buildRootId = null; currentSeqId = -1; building = false;
       sim.active = false; sim.alpha = 0; anim = null;
+      prunePending = false; fadeRAF = null;
       vscode.setState(null);
       placeholderEl.style.display = 'flex';
       statusEl.textContent = '';
@@ -779,6 +905,7 @@ export class GraphSideView {
     });
 
     // initial paint of any restored map
+    reflectPersist();
     handleResize();
     if (nodeMap.size) { placeholderEl.style.display = 'none'; updateStatus(); }
     draw();
