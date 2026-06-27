@@ -1,20 +1,21 @@
 import * as vscode from 'vscode';
-import { buildFocusedGraph } from '../graph/data/focusedGraphBuilder';
+import { buildFocusedGraph, expandDependencies } from '../graph/data/focusedGraphBuilder';
+import { buildTieredGraph } from '../graph/data/tieredGraphBuilder';
+import { FocusedGraphNode, FocusedGraphEdge } from '../graph/data/focusedGraphTypes';
+import { bumpEpoch, invalidateExpansion } from '../graph/data/expansionCache';
 import { providerForUri } from '../graph/lang/registry';
 
 // Side-effect import: registers language providers (java, python).
 import '../graph/lang';
 
 /**
- * The graph is an editor panel whose map the webview owns. By default it is
- * ephemeral: each selection shows only that class plus one hop around it, and the
- * previous neighbourhood is discarded. A "Persist" toggle in the webview switches
- * to an accumulating map where every visited class keeps its coordinates once
- * placed. Either way the map survives reloads via webview state. This extension
- * side is a stateless build service — it never forces a redraw. When the active
- * editor changes it merely tells the webview which file is now active; the webview
- * pans to it if already on the map (no rebuild, no flicker) or asks for a build
- * only when the class is new or unexpanded.
+ * The graph is an editor panel whose map the webview owns. It is ephemeral: each
+ * selection shows only that class plus one hop around it, and the previous
+ * neighbourhood is discarded. The map survives reloads via webview state. This
+ * extension side is a stateless build service — it never forces a redraw. When the
+ * active editor changes it merely tells the webview which file is now active; the
+ * webview pans to it if already on the map (no rebuild, no flicker) or asks for a
+ * build only when the class is new or unexpanded.
  */
 export class GraphSideView {
   static readonly viewId = 'codenav.graphView';
@@ -30,8 +31,33 @@ export class GraphSideView {
         if (!this.panel?.visible) { return; }
         const uri = editor?.document.uri;
         if (uri && providerForUri(uri.toString())) { this.postActiveFile(uri); }
-      })
+      }),
+      vscode.workspace.onDidSaveTextDocument((doc) => { void this.onFileSaved(doc); })
     );
+  }
+
+  /**
+   * A save invalidates cached neighbourhoods: the saved file's own dependencies
+   * change (intrinsic), and its references to other classes may change every other
+   * node's caller/sibling lists (extrinsic). We drop its cached expansion and bump
+   * the workspace epoch so those extrinsic halves re-resolve on next touch. If the
+   * saved file is the graph's current focus, its dependency ring is patched live —
+   * incoming callers come from other files and can't change on its own save.
+   */
+  private async onFileSaved(doc: vscode.TextDocument): Promise<void> {
+    const uriStr = doc.uri.toString();
+    if (!providerForUri(uriStr)) { return; }
+    invalidateExpansion(uriStr);
+    bumpEpoch();
+    if (!this.panel?.visible) { return; }
+    const result = await expandDependencies(doc.uri);
+    if (!result || !this.panel) { return; }
+    this.panel.webview.postMessage({
+      command: 'patchDeps',
+      uri: uriStr,
+      nodes: result.deps.nodes,
+      edges: result.deps.edges,
+    });
   }
 
   /** Open (or focus) the graph editor panel. */
@@ -86,13 +112,16 @@ export class GraphSideView {
           if (this.javaReady) { this.postActiveFile(); }
           break;
         case 'requestBuild':
-          if (msg.uri) { void this.buildTwoTier(vscode.Uri.parse(msg.uri)); }
+          if (msg.uri) { void this.runTieredBuild(vscode.Uri.parse(msg.uri)); }
           break;
         case 'requestBuildActive': {
           const uri = vscode.window.activeTextEditor?.document.uri;
-          if (uri && providerForUri(uri.toString())) { void this.buildTwoTier(uri); }
+          if (uri && providerForUri(uri.toString())) { void this.runTieredBuild(uri); }
           break;
         }
+        case 'hoverExpand':
+          if (msg.uri) { void this.hoverExpand(vscode.Uri.parse(msg.uri)); }
+          break;
         case 'navigate':
           if (msg.uri) {
             const doc = await vscode.workspace.openTextDocument(vscode.Uri.parse(msg.uri));
@@ -124,91 +153,67 @@ export class GraphSideView {
   }
 
   /**
-   * Three-tier build (+2 deep):
-   *   Active tier  — center + its direct callers + deps (fully opaque)
-   *   Inactive tier — each active neighbour's own callers + deps (transparent)
-   *   Hidden tier  — each inactive node's own callers + deps; not drawn by default,
-   *                  revealed only when its owner is hovered, for extra precision.
-   *
-   * Stages are tagged with a seqId so the webview can discard stale messages from
-   * a superseded build without any race between cancelled and incoming messages.
+   * Build the tiered (+2-deep) neighbourhood around a class and stream it to the
+   * webview. The tier-walking, classification and dedup all live in the pure,
+   * unit-tested `buildTieredGraph` (see graph/data/tieredGraphBuilder.ts); this method
+   * is just the VSCode glue — it wires `buildFocusedGraph` as the per-class expander
+   * and `postMessage` as the update sink, and owns cancellation. Each message carries
+   * a seqId so the webview can discard stages from a superseded build.
    */
-  private async buildTwoTier(centerUri: vscode.Uri): Promise<void> {
+  private async runTieredBuild(centerUri: vscode.Uri): Promise<void> {
     if (!this.panel) { return; }
     this.cancelCurrent?.();
     let cancelled = false;
     this.cancelCurrent = () => { cancelled = true; };
     const panel = this.panel;
-    const centerUriStr = centerUri.toString();
     const seqId = ++this.buildSeq;
 
-    // URIs that belong to the active tier — skip them when building inactive.
-    const activeTierUris = new Set<string>([centerUriStr]);
-    const inactiveQueue: string[] = [];
+    const model = await buildTieredGraph({
+      centerUri: centerUri.toString(),
+      seqId,
+      expand: (uri, onStage, isCancelled) =>
+        buildFocusedGraph(vscode.Uri.parse(uri), onStage, isCancelled),
+      emit: (msg) => { void panel.webview.postMessage(msg); },
+      isCancelled: () => cancelled,
+    });
 
-    // ── Active tier ─────────────────────────────────────────────────────────
-    await buildFocusedGraph(
-      centerUri,
-      (update) => {
-        if (cancelled) { return; }
-        if ('nodes' in update) {
-          for (const n of update.nodes) {
-            if (!activeTierUris.has(n.uri)) {
-              activeTierUris.add(n.uri);
-              inactiveQueue.push(n.uri);
-            }
-          }
-        }
-        panel.webview.postMessage({ command: 'stage', seqId, tier: 'active', forUri: centerUriStr, ...update });
-      },
-      () => cancelled
-    );
+    // Reconcile the webview to the authoritative model: the returned graph is the single
+    // source of truth for which nodes belong and their tier/counts. This corrects any
+    // drift in the webview's incremental bookkeeping — e.g. a shadow node that must
+    // survive a rebuild that re-references it — and is exactly the shape the unit tests
+    // pin (see tieredGraphBuilder.test.ts). 'selected' folds into 'active' on the wire.
+    if (cancelled || !this.panel) { return; }
+    const nodes = [...model.nodes.values()].map((n) => ({
+      id: n.id,
+      tier: n.tier === 'selected' ? 'active' : n.tier,
+      expanded: n.expanded,
+      callers: n.callers,
+      deps: n.deps,
+    }));
+    this.panel.webview.postMessage({ command: 'reconcile', seqId, nodes });
+  }
 
-    if (cancelled) { return; }
-
-    // Focal tier complete — tell the webview to settle the layout once.
-    panel.webview.postMessage({ command: 'activeDone', seqId });
-
-    // ── Inactive tier — one neighbour at a time ──────────────────────────────
-    const seenUris = new Set<string>(activeTierUris);
-    const hiddenQueue: string[] = [];
-    for (const neighborUri of inactiveQueue) {
-      if (cancelled) { break; }
-      await buildFocusedGraph(
-        vscode.Uri.parse(neighborUri),
-        (update) => {
-          if (cancelled) { return; }
-          if ('nodes' in update) {
-            for (const n of update.nodes) {
-              if (!seenUris.has(n.uri)) { seenUris.add(n.uri); hiddenQueue.push(n.uri); }
-            }
-          }
-          panel.webview.postMessage({ command: 'stage', seqId, tier: 'inactive', forUri: neighborUri, ...update });
-        },
-        () => cancelled
-      );
-    }
-
-    if (cancelled) { return; }
-
-    // ── Hidden tier (+2 deep) — each inactive node's own neighbourhood. These are
-    // never drawn until the user hovers their owner, so they add precision without
-    // changing what's visible by default.
-    for (const hiddenUri of hiddenQueue) {
-      if (cancelled) { break; }
-      await buildFocusedGraph(
-        vscode.Uri.parse(hiddenUri),
-        (update) => {
-          if (cancelled) { return; }
-          panel.webview.postMessage({ command: 'stage', seqId, tier: 'hidden', forUri: hiddenUri, ...update });
-        },
-        () => cancelled
-      );
-    }
-
-    if (!cancelled) {
-      panel.webview.postMessage({ command: 'buildDone', seqId });
-    }
+  /**
+   * Resolve one class's *complete* neighbourhood on demand and patch it into the
+   * graph. The tiered build only loads up to the shadow ring (+2 deep from the
+   * selection), so a shadow node's own callers/deps live one hop beyond that boundary
+   * and aren't present. When the user hovers such a node, the webview asks for this —
+   * we run `buildFocusedGraph` (served from the expansion cache after the first time,
+   * so repeat hovers are free) and post back its full caller/dependency set.
+   */
+  private async hoverExpand(uri: vscode.Uri): Promise<void> {
+    if (!this.panel) { return; }
+    const uriStr = uri.toString();
+    const nodes: FocusedGraphNode[] = [];
+    const edges: FocusedGraphEdge[] = [];
+    await buildFocusedGraph(uri, (update) => {
+      if (update.stage !== 'center') {
+        nodes.push(...update.nodes);
+        edges.push(...update.edges);
+      }
+    });
+    if (!this.panel) { return; }
+    this.panel.webview.postMessage({ command: 'hoverNeighbourhood', uri: uriStr, nodes, edges });
   }
 
   private getHtml(): string {
@@ -225,23 +230,6 @@ export class GraphSideView {
            font-family: var(--vscode-font-family); display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
     #cy { flex: 1; position: relative; min-height: 0; overflow: hidden; }
     canvas { display: block; position: absolute; inset: 0; }
-
-    #floatBtns { z-index: 5; position: absolute; right: 12px; bottom: 12px; display: flex; gap: 7px; align-items: center; }
-    .gbtn {
-      background: var(--vscode-editorWidget-background, #252526);
-      color: var(--vscode-foreground, #cccccc);
-      border: 1px solid rgba(128,128,128,0.35);
-      padding: 5px 11px; border-radius: 7px; cursor: pointer;
-      font-size: 11px; font-weight: 500; line-height: 1.2; user-select: none;
-      transition: background .12s, border-color .12s, opacity .12s;
-    }
-    .gbtn:hover { background: var(--vscode-toolbar-hoverBackground, #2a2d2e); border-color: rgba(128,128,128,0.6); }
-    .gbtn.active {
-      background: var(--vscode-button-background, #0e639c);
-      color: var(--vscode-button-foreground, #ffffff);
-      border-color: var(--vscode-button-background, #0e639c);
-    }
-    .gbtn.active:hover { background: var(--vscode-button-hoverBackground, #1177bb); }
 
     #status { padding: 4px 12px; font-size: 11px; color: var(--vscode-descriptionForeground);
               border-top: 1px solid var(--vscode-panel-border); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -307,9 +295,6 @@ export class GraphSideView {
       <p id="introMsg">Open a Java class to explore its graph</p>
     </div>
     <div id="progress"><span class="spinner"></span><span id="progressText"></span></div>
-    <div id="floatBtns">
-      <button id="btnPersist" class="gbtn" title="Keep every visited class on the map instead of showing only the current selection">Persist</button>
-    </div>
   </div>
   <div id="status"></div>
   <script>
@@ -321,7 +306,6 @@ export class GraphSideView {
     const introMsg       = document.getElementById('introMsg');
     const progressEl     = document.getElementById('progress');
     const progressTextEl = document.getElementById('progressText');
-    const btnPersist     = document.getElementById('btnPersist');
 
     // ── live build progress (bottom-left pill) ──────────────────────────────────
     let progressHideTimer = null;
@@ -350,7 +334,7 @@ export class GraphSideView {
         if (msg.stage === 'siblings')     { return 'Loading siblings of ' + nm + '…'; }
       }
       if (msg.tier === 'inactive') { return 'Loading connections of ' + nm + '…'; }
-      if (msg.tier === 'hidden')   { return 'Scanning deeper around ' + nm + '…'; }
+      if (msg.tier === 'shadow')   { return 'Scanning deeper around ' + nm + '…'; }
       return 'Loading…';
     }
 
@@ -382,17 +366,18 @@ export class GraphSideView {
     // driven by the loading flow (LSP-starting → preparing) instead.
     function playIntro() { if (nodeMap.size) { showIntro(2000); } }
 
-    // ── persistent map (single source of truth) ────────────────────────────────
+    // ── graph map (single source of truth) ──────────────────────────────────────
     // nodeMap: id -> { id,name,uri,line,kind,tags, x,y, expanded }
     let nodeMap = new Map();
     let edges   = [];                 // { from, to, kind }
     let edgeKeys = new Set();         // 'from|to' — dedup directed pairs
     let activeId = null;
+    // Authoritative caller/dependency counts per node id, computed by the builder when
+    // it expands a node (see tieredGraphBuilder). Sticky across rebuilds, so selecting a
+    // node that was previously loaded (e.g. an inactive node) shows its true count at
+    // once instead of counting whatever partial edges happen to be on the canvas.
+    let nodeCounts = new Map();       // id -> { callers, deps }
     let view = { x: 0, y: 0, scale: 1 };
-    // persist=false (default): each selection shows only that class + 1 hop, the
-    // previous neighbourhood is discarded. persist=true accumulates every visited
-    // class on a single growing map.
-    let persist = false;
 
     // transient
     let javaReady = false;
@@ -411,7 +396,13 @@ export class GraphSideView {
     // Node radius scales with how many connections a class has (degree). NODE_R is
     // the base (half the old fixed 16); well-connected classes grow up to +18.
     let nodeDeg = new Map();
+    // Degrees only change when the edge set changes, so recompute lazily on a dirty
+    // flag instead of on every frame (draw runs many times per second during tweens).
+    let degDirty = true;
+    function markEdgesChanged() { degDirty = true; }
     function recomputeDegrees() {
+      if (!degDirty) { return; }
+      degDirty = false;
       nodeDeg = new Map();
       for (const e of edges) {
         nodeDeg.set(e.from, (nodeDeg.get(e.from) || 0) + 1);
@@ -427,7 +418,7 @@ export class GraphSideView {
         // Clear any transient fade/tween state captured mid-transition so a reload
         // doesn't restore half-faded, mid-glide, or about-to-be-removed nodes.
         for (const n of s.nodes) {
-          n.fade = n.tier === 'hidden' ? 0 : 1;   // hidden nodes stay invisible until hovered
+          n.fade = n.tier === 'shadow' ? 0 : 1;   // shadow nodes stay invisible until hovered
           delete n.stale; delete n.tgx; delete n.tgy; delete n.sx; delete n.sy;
           nodeMap.set(n.id, n);
         }
@@ -437,7 +428,7 @@ export class GraphSideView {
         if (s.view) { view = s.view; }
       }
       if (s && s.lastFileUri) { lastFileUri = s.lastFileUri; }
-      if (s && typeof s.persist === 'boolean') { persist = s.persist; }
+      if (s && Array.isArray(s.nodeCounts)) { nodeCounts = new Map(s.nodeCounts); }
     })();
 
     let saveTimer = null;
@@ -445,7 +436,7 @@ export class GraphSideView {
       if (saveTimer) { return; }
       saveTimer = setTimeout(() => {
         saveTimer = null;
-        vscode.setState({ nodes: [...nodeMap.values()], edges, activeId, view, lastFileUri, persist });
+        vscode.setState({ nodes: [...nodeMap.values()], edges, activeId, view, lastFileUri, nodeCounts: [...nodeCounts] });
       }, 250);
     }
 
@@ -499,7 +490,7 @@ export class GraphSideView {
       for (let iter = 0; iter < 14; iter++) {
         let dx = 0, dy = 0, d = Infinity;
         for (const m of nodeMap.values()) {
-          if (m.stale) { continue; }   // leaving nodes don't reserve space (hidden ones still do)
+          if (m.stale) { continue; }   // leaving nodes don't reserve space (shadow ones still do)
           const ex = x - m.x, ey = y - m.y, ed = Math.hypot(ex, ey);
           if (ed < d) { d = ed; dx = ex; dy = ey; }
         }
@@ -525,57 +516,7 @@ export class GraphSideView {
     }
     function addEdge(e) {
       const k = e.from + '|' + e.to;
-      if (!edgeKeys.has(k)) { edgeKeys.add(k); edges.push(e); }
-    }
-
-    // ── force layout ─────────────────────────────────────────────────────────
-    // A light force simulation keeps elements from overlapping. Hard overlap
-    // resolution (relaxOverlaps) guarantees every pair stays MIN_DIST apart, while
-    // soft directional springs pull each edge's target one level below its source
-    // (callers above → centre → dependencies below). Cooling settles the layout,
-    // then a final relax pass guarantees no residual overlap before saving.
-    let sim = { active: false, alpha: 0 };
-    function kickSim(strength) {
-      sim.alpha = Math.min(1, Math.max(sim.alpha, strength == null ? 1 : strength));
-      if (!sim.active) { sim.active = true; requestAnimationFrame(simStep); }
-    }
-    function relaxOverlaps() {
-      const nodes = [...nodeMap.values()].filter(n => !n.stale);
-      for (let iter = 0; iter < 2; iter++) {
-        for (let i = 0; i < nodes.length; i++) {
-          for (let j = i + 1; j < nodes.length; j++) {
-            const a = nodes[i], b = nodes[j];
-            let dx = b.x - a.x, dy = b.y - a.y;
-            let d = Math.hypot(dx, dy);
-            if (d === 0) { dx = (Math.random() - 0.5) * 2; dy = (Math.random() - 0.5) * 2; d = Math.hypot(dx, dy) || 0.001; }
-            if (d < MIN_DIST) {
-              const push = (MIN_DIST - d) / 2;
-              const ux = dx / d, uy = dy / d;
-              if (a !== dragging) { a.x -= ux * push; a.y -= uy * push; }
-              if (b !== dragging) { b.x += ux * push; b.y += uy * push; }
-            }
-          }
-        }
-      }
-    }
-    function simStep() {
-      if (sim.alpha < 0.03) { relaxOverlaps(); sim.active = false; draw(); scheduleSave(); return; }
-      // Soft directional springs: every edge's 'to' node sits LEVEL_Y below 'from',
-      // and is pulled toward horizontal alignment with it.
-      for (const e of edges) {
-        const a = nodeMap.get(e.from), b = nodeMap.get(e.to);
-        if (!a || !b || a.stale || b.stale) { continue; }   // hidden nodes still pull layout
-        const vy = ((b.y - a.y) - LEVEL_Y) * 0.5 * sim.alpha;
-        if (a !== dragging) { a.y += vy; }
-        if (b !== dragging) { b.y -= vy; }
-        const hx = (b.x - a.x) * 0.04 * sim.alpha;
-        if (a !== dragging) { a.x += hx; }
-        if (b !== dragging) { b.x -= hx; }
-      }
-      relaxOverlaps();
-      sim.alpha *= 0.92;
-      draw();
-      requestAnimationFrame(simStep);
+      if (!edgeKeys.has(k)) { edgeKeys.add(k); edges.push(e); markEdgesChanged(); }
     }
 
     // ── layered (Sugiyama-style) layout ────────────────────────────────────────
@@ -590,7 +531,7 @@ export class GraphSideView {
     // The active node is anchored at (0,0) so it stays the visual centre, and every
     // node animates to its target (tween) so re-layouts stay fluid.
     function layeredLayout() {
-      // Hidden (+2-deep) nodes are invisible but still laid out — they reserve their
+      // Shadow (+2-deep) nodes are invisible but still laid out — they reserve their
       // place in the graph so revealing one on hover slots it into a ready gap
       // instead of shoving the visible nodes around.
       const nodes = [...nodeMap.values()].filter(n => !n.stale);
@@ -747,6 +688,21 @@ export class GraphSideView {
       startTween();
     }
 
+    // Defer the global layout to the next frame and coalesce repeated requests, so the
+    // click that triggers a rebuild paints its highlight + camera pan first and the
+    // O(graph) layout runs once — off the input frame — instead of blocking it.
+    let layoutRAF = null, layoutThen = null;
+    function scheduleLayout(then) {
+      if (then) { layoutThen = then; }
+      if (layoutRAF) { return; }
+      layoutRAF = requestAnimationFrame(() => {
+        layoutRAF = null;
+        const cb = layoutThen; layoutThen = null;
+        layeredLayout();
+        if (cb) { cb(); }
+      });
+    }
+
     // Ease every node with a target (tgx,tgy) from its current spot to it.
     const TWEEN_MS = 280;
     let tweenRAF = null, tweenStart = 0;
@@ -777,13 +733,13 @@ export class GraphSideView {
     // Every node eases its render opacity toward a target: 1 when it belongs to
     // the current view, 0 when marked .stale (a removal candidate). New nodes
     // start at fade 0 so they grow in; stale nodes shrink out — both over ~150ms.
-    // Stale nodes are also dropped from layout immediately (freeSpot/relaxOverlaps
+    // Stale nodes are also dropped from layout immediately (freeSpot/layeredLayout
     // skip them) so they free their space at once, while rescued nodes keep their
     // exact spot. Fully-faded stale nodes are deleted only once the build has
     // finished (prunePending), so a node rescued mid-build is never lost.
     const FADE_MS = 150;
     let fadeRAF = null, lastFadeTs = 0, prunePending = false;
-    let revealed = new Set();   // hidden-tier node ids currently shown (hovered owner)
+    let revealed = new Set();   // shadow-tier node ids currently shown (hovered owner)
     let hoverSet = new Set();   // hovered node + its direct neighbours (the hover context)
     function kickFade() { if (!fadeRAF) { fadeRAF = requestAnimationFrame(fadeStep); } }
     function fadeStep(ts) {
@@ -793,8 +749,8 @@ export class GraphSideView {
       const rate = dt / FADE_MS;
       let active = false, removed = false;
       for (const n of nodeMap.values()) {
-        // Hidden nodes rest at 0 and only rise while revealed by a hover.
-        const target = (n.stale || (n.tier === 'hidden' && !revealed.has(n.id))) ? 0 : 1;
+        // Shadow nodes rest at 0 and only rise while revealed by a hover.
+        const target = (n.stale || (n.tier === 'shadow' && !revealed.has(n.id))) ? 0 : 1;
         if (n.fade == null) { n.fade = target; }
         if (n.fade < target)      { n.fade = Math.min(target, n.fade + rate); active = true; }
         else if (n.fade > target) { n.fade = Math.max(target, n.fade - rate); active = true; }
@@ -808,6 +764,7 @@ export class GraphSideView {
       if (removed) {
         edges = edges.filter(e => nodeMap.has(e.from) && nodeMap.has(e.to));
         edgeKeys = new Set(edges.map(e => e.from + '|' + e.to));
+        markEdgesChanged();
       }
       draw();
       if (active || prunePending) { kickFade(); }
@@ -964,24 +921,26 @@ export class GraphSideView {
     }
 
     function draw() {
-      refreshTheme();
+      // Theme is cached (refreshed only on theme change) and degrees recompute only
+      // when edges change — draw runs many times per second during tweens, so neither
+      // belongs in the hot path.
       recomputeDegrees();
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.clearRect(0, 0, viewW, viewH);
       // Arrows are drawn for exactly one node at a time: the hovered node if any,
       // otherwise the selected node. Hovering another element reveals only its
-      // connections (including its hidden +2-deep neighbours) and hides the rest.
+      // connections (including its shadow +2-deep neighbours) and hides the rest.
       const focusId = hoverNode ? hoverNode.id : activeId;
       for (const e of edges) {
         if (e.from !== focusId && e.to !== focusId) { continue; }
         const a = nodeMap.get(e.from), b = nodeMap.get(e.to);
         if (!a || !b) { continue; }
-        // Hidden (+2-deep) nodes only appear while their owner is hovered.
-        if ((a.tier === 'hidden' && (a.fade ?? 0) <= 0.01) || (b.tier === 'hidden' && (b.fade ?? 0) <= 0.01)) { continue; }
+        // Shadow (+2-deep) nodes only appear while their owner is hovered.
+        if ((a.tier === 'shadow' && (a.fade ?? 0) <= 0.01) || (b.tier === 'shadow' && (b.fade ?? 0) <= 0.01)) { continue; }
         drawEdge(e, !!hoverNode);
       }
       // Active node paints last (on top); hovered node above that.
-      const drawable = [...nodeMap.values()].filter(n => n.tier !== 'hidden' || (n.fade ?? 0) > 0.01);
+      const drawable = [...nodeMap.values()].filter(n => n.tier !== 'shadow' || (n.fade ?? 0) > 0.01);
       const ordered = drawable.sort((a, b) => (a.id === activeId ? 1 : 0) - (b.id === activeId ? 1 : 0));
       const withHover = hoverNode ? [...ordered.filter(n => n !== hoverNode), hoverNode] : ordered;
       withHover.forEach(drawNode);
@@ -992,10 +951,18 @@ export class GraphSideView {
       // callers (who use it) and dependencies (what it uses). Otherwise totals.
       const focus = hoverNode || (activeId ? nodeMap.get(activeId) : null);
       if (focus) {
+        // Prefer the builder's authoritative count (exact for any expanded node). Fall
+        // back to counting live edges only for nodes never expanded (shadow frontier),
+        // where the true count isn't known yet.
+        const auth = nodeCounts.get(focus.id);
         let callers = 0, deps = 0;
-        for (const e of edges) {
-          if (e.to === focus.id) { callers++; }       // X→focus: X uses focus → caller
-          else if (e.from === focus.id) { deps++; }   // focus→Y: focus uses Y → dependency
+        if (auth) {
+          callers = auth.callers; deps = auth.deps;
+        } else {
+          for (const e of edges) {
+            if (e.to === focus.id) { callers++; }       // X→focus: X uses focus → caller
+            else if (e.from === focus.id) { deps++; }   // focus→Y: focus uses Y → dependency
+          }
         }
         const cal = callers === 1 ? '1 caller' : callers + ' callers';
         const dep = deps === 1 ? '1 dependency' : deps + ' dependencies';
@@ -1033,6 +1000,44 @@ export class GraphSideView {
       if (nodeMap.size === 0) { setIntroMsg('Preparing the graph…'); showIntro(1000); }
       vscode.postMessage({ command: 'requestBuild', uri: uri });
     }
+    // Live-patch the focus node's dependency ring after its file is saved: add newly
+    // referenced types, drop ones it no longer uses (fading out any left orphaned),
+    // then re-settle. Callers are untouched — a file's own save can't change them.
+    function reconcileDeps(root, depNodes, depEdges) {
+      const newTargets = new Set(depEdges.filter(e => e.from === root.id).map(e => e.to));
+
+      // Remove dependency edges (root→X) that no longer exist.
+      const dropped = [];
+      edges = edges.filter(e => {
+        if (e.from === root.id && !newTargets.has(e.to)) { edgeKeys.delete(e.from + '|' + e.to); dropped.push(e.to); return false; }
+        return true;
+      });
+      markEdgesChanged();
+      // Orphan any dropped target that nothing else connects to (keep the focus itself).
+      for (const tid of dropped) {
+        const n = nodeMap.get(tid);
+        if (n && tid !== activeId && tid !== root.id && !edges.some(e => e.from === tid || e.to === tid)) { n.stale = true; }
+      }
+
+      // Add new dependency nodes below the focus; rescue/reveal any that already exist.
+      placeGroup(root, depNodes.filter(n => !nodeMap.has(n.id)), LEVEL_Y, root.tier || 'active');
+      for (const e of depEdges) {
+        const ex = nodeMap.get(e.to);
+        if (ex) { ex.stale = false; if (ex.tier === 'shadow') { ex.tier = 'inactive'; } }
+        addEdge(e);
+      }
+
+      prunePending = true; kickFade();
+      // The focus is the centre (complete edges), so its live-edge count is exact —
+      // refresh the sticky authoritative count to match the post-save dependency ring.
+      nodeCounts.set(root.id, {
+        callers: edges.filter(e => e.to === root.id).length,
+        deps:    edges.filter(e => e.from === root.id).length,
+      });
+      updateStatus(); scheduleSave();
+      scheduleLayout();
+    }
+
     function focusFile(uri) {
       if (!javaReady) { pendingActive = uri; return; }
       const n = findByUri(uri);
@@ -1046,9 +1051,9 @@ export class GraphSideView {
       if (msg.command === 'javaReady') {
         javaReady = msg.ready;
         if (!msg.ready) {
-          if (nodeMap.size === 0) { setIntroMsg('Waiting for the Java language server…'); showIntro(true); }
+          if (nodeMap.size === 0) { setIntroMsg('Waiting for the Language Server Provider…'); showIntro(true); }
         } else {
-          if (nodeMap.size === 0) { setIntroMsg('Open a Java class to explore its graph'); showIntro(true); }
+          if (nodeMap.size === 0) { setIntroMsg('Open a file to explore its graph'); showIntro(true); }
           if (pendingActive) { const u = pendingActive; pendingActive = null; focusFile(u); }
         }
         return;
@@ -1064,15 +1069,59 @@ export class GraphSideView {
         focusFile(msg.uri); return;
       }
 
-      // The focal (active) tier finished streaming — lay it out once so it settles
-      // smoothly instead of shaking on every incoming class. Ephemeral mode uses
-      // the crossing-minimising layered layout; persist mode keeps the incremental
-      // force sim so the accumulating map stays positionally stable.
+      // A saved file's dependencies were recomputed. Only patch when that file is the
+      // graph's current focus — saving it can't change who calls it, only what it uses.
+      if (msg.command === 'patchDeps') {
+        const node = findByUri(msg.uri);
+        if (node && node.id === activeId) { reconcileDeps(node, msg.nodes || [], msg.edges || []); }
+        return;
+      }
+
+      // Authoritative caller/dependency counts for an expanded node, from the builder.
+      // No seqId gate — a node's true count doesn't depend on which build observed it,
+      // so even a superseded build's counts are valid and worth keeping (sticky).
+      if (msg.command === 'counts') {
+        nodeCounts.set(msg.id, { callers: msg.callers, deps: msg.deps });
+        const focus = hoverNode || (activeId ? nodeMap.get(activeId) : null);
+        if (focus && focus.id === msg.id) { updateStatus(); }
+        scheduleSave();
+        return;
+      }
+
+      // A hovered node's full neighbourhood arrived (lazy-expand). Patch in the missing
+      // callers/deps so its count and revealed context match what a click would show —
+      // without re-centring or re-running the global layout. Fresh neighbours are added
+      // co-located on the node (callers above, deps below) as shadow nodes, invisible
+      // until the hover reveals them.
+      if (msg.command === 'hoverNeighbourhood') {
+        hoverExpandPending.delete(msg.uri);
+        const node = findByUri(msg.uri);
+        if (!node) { return; }
+        node.expanded = true;
+        const incomingEdges = msg.edges || [];
+        const callerIds = new Set(incomingEdges.filter(e => e.to === node.id).map(e => e.from));
+        const fresh = (msg.nodes || []).filter(n => !nodeMap.has(n.id));
+        placeGroup(node, fresh.filter(n => callerIds.has(n.id)),  -LEVEL_Y, 'shadow');
+        placeGroup(node, fresh.filter(n => !callerIds.has(n.id)),  LEVEL_Y, 'shadow');
+        for (const e of incomingEdges) { addEdge(e); }
+        // The patch is the node's complete neighbourhood, so its count is now exact.
+        nodeCounts.set(node.id, {
+          callers: incomingEdges.filter(e => e.to === node.id).length,
+          deps:    incomingEdges.filter(e => e.from === node.id).length,
+        });
+        // Reveal the new context only if the cursor is still on this node.
+        if (hoverNode && hoverNode.id === node.id) { updateReveal(); }
+        updateStatus(); kickFade(); draw(); scheduleSave();
+        return;
+      }
+
+      // The focal (active) tier finished streaming — lay it out once with the
+      // crossing-minimising layered layout so it settles smoothly instead of shaking
+      // on every incoming class.
       if (msg.command === 'activeDone') {
         if (msg.seqId !== currentSeqId) { return; }
         showProgress('Rebalancing the graph…');
-        if (persist) { kickSim(1); } else { layeredLayout(); }
-        focusActive();   // re-centre once the core graph has a layout
+        scheduleLayout(focusActive);   // lay out, then re-centre — off the input frame
         return;
       }
       // The whole build (incl. the faint inactive neighbours) finished.
@@ -1081,11 +1130,35 @@ export class GraphSideView {
         building = false;
         // Anything still marked stale wasn't part of the new view — let it finish
         // fading, then the engine deletes it.
-        if (!persist) { prunePending = true; kickFade(); layeredLayout(); }
+        prunePending = true; kickFade();
         updateStatus();
-        showProgress('Finalizing the hierarchy…');
+        showProgress('Stabilizing the layout…');
         hideProgress(700);
-        focusActive();   // final re-centre once loading is complete
+        scheduleLayout(focusActive);   // final layout + re-centre, deferred
+        return;
+      }
+
+      // Authoritative reconcile against the builder's model: sync every node's tier,
+      // expanded flag and counts, keep exactly the nodes the model contains, and stale
+      // the rest for pruning. This is what guarantees the canvas matches the unit-tested
+      // model — e.g. an inactive node's whole shadow ring survives a rebuild and stays
+      // hover-revealable, instead of being silently pruned.
+      if (msg.command === 'reconcile') {
+        if (msg.seqId !== currentSeqId) { return; }
+        const auth = new Map((msg.nodes || []).map(n => [n.id, n]));
+        for (const node of nodeMap.values()) {
+          const a = auth.get(node.id);
+          if (a) {
+            node.stale = false;
+            node.tier = a.tier;
+            node.expanded = a.expanded;
+            if (a.callers >= 0) { nodeCounts.set(node.id, { callers: a.callers, deps: a.deps }); }
+          } else {
+            node.stale = true;   // not in the model → fade out and prune
+          }
+        }
+        prunePending = true; kickFade();
+        updateStatus(); scheduleSave(); scheduleLayout();
         return;
       }
 
@@ -1094,21 +1167,13 @@ export class GraphSideView {
         if (msg.tier === 'active' && msg.stage === 'center') {
           currentSeqId = msg.seqId;
           building = true;
-          if (persist) {
-            // Persist mode — downgrade all existing nodes to inactive so the
-            // active tier is rebuilt cleanly from the new centre outward, but
-            // keep every previously visited class on the map.
-            for (const n of nodeMap.values()) { if (n.tier !== 'hidden') { n.tier = 'inactive'; } n.expanded = false; n.tgx = null; n.tgy = null; }
-          } else {
-            // Ephemeral mode (default) — don't wipe the map. Mark every node as a
-            // removal candidate; the incoming build "rescues" the ones the new
-            // neighbourhood shares (un-marking them, keeping their exact spot).
-            // Marked nodes immediately stop occupying layout space and fade out;
-            // whatever stays marked is deleted once the build completes.
-            for (const n of nodeMap.values()) { if (n.tier !== 'hidden') { n.tier = 'inactive'; } n.expanded = false; n.stale = true; }
-            revealed = new Set();
-            kickFade();
-          }
+          // Don't wipe the map. Mark every node as a removal candidate; the incoming
+          // build "rescues" the ones the new neighbourhood shares (un-marking them,
+          // keeping their exact spot). Marked nodes immediately stop occupying layout
+          // space and fade out; whatever stays marked is deleted once the build ends.
+          for (const n of nodeMap.values()) { if (n.tier !== 'shadow') { n.tier = 'inactive'; } n.expanded = false; n.stale = true; }
+          revealed = new Set();
+          kickFade();
         } else if (msg.seqId !== currentSeqId) {
           return;  // stale stage from a superseded build
         }
@@ -1158,22 +1223,35 @@ export class GraphSideView {
             const root = findByUri(msg.forUri);
             if (!root) { return; }
             const dirY = msg.stage === 'callers' ? -LEVEL_Y : msg.stage === 'dependencies' ? LEVEL_Y : 0;
-            // Rescue any shared node this inactive neighbour reuses, then place the rest.
-            for (const n of (msg.nodes || [])) { const ex = nodeMap.get(n.id); if (ex) { ex.stale = false; } }
+            // Rescue any shared node this inactive neighbour reuses (promoting a former
+            // shadow node up to inactive — never downgrade an active one), then place the rest.
+            for (const n of (msg.nodes || [])) {
+              const ex = nodeMap.get(n.id);
+              if (ex) { ex.stale = false; if (ex.tier === 'shadow') { ex.tier = 'inactive'; } }
+            }
             const fresh = (msg.nodes || []).filter(n => !nodeMap.has(n.id));
             placeGroup(root, fresh, dirY, 'inactive');
             for (const e of (msg.edges || [])) { addEdge(e); }
           }
-        } else if (msg.tier === 'hidden') {
-          // +2-deep neighbourhood of an inactive node. Add only genuinely new nodes
-          // as a hidden tier — co-located on their owner, invisible until that owner
-          // is hovered (then positioned and faded in by updateReveal). Existing
-          // nodes are never downgraded; only the edges are recorded.
+        } else if (msg.tier === 'shadow') {
+          // +2-deep neighbourhood of an inactive node — co-located on their owner,
+          // invisible until that owner is hovered (then positioned and faded in by
+          // updateReveal).
           if (msg.stage !== 'center') {
             const owner = findByUri(msg.forUri);
+            // The inactive owner's own neighbourhood is now fully loaded — mark it so
+            // hovering it doesn't trigger a redundant lazy expand.
+            if (owner) { owner.expanded = true; }
             for (const n of (msg.nodes || [])) {
-              if (!nodeMap.has(n.id)) {
-                nodeMap.set(n.id, { ...n, x: owner ? owner.x : 0, y: owner ? owner.y : 0, tier: 'hidden', expanded: false, fade: 0 });
+              const ex = nodeMap.get(n.id);
+              if (!ex) {
+                nodeMap.set(n.id, { ...n, x: owner ? owner.x : 0, y: owner ? owner.y : 0, tier: 'shadow', expanded: false, fade: 0 });
+              } else if (ex.stale) {
+                // Re-referenced this build only as a shadow neighbour: rescue it from the
+                // end-of-build prune and keep it shadow. (Nodes claimed by the active or
+                // inactive passes were already un-staled and keep their higher tier.)
+                ex.stale = false;
+                ex.tier = 'shadow';
               }
             }
             for (const e of (msg.edges || [])) { addEdge(e); }
@@ -1198,7 +1276,7 @@ export class GraphSideView {
       const nodes = [...nodeMap.values()];
       for (let i = nodes.length - 1; i >= 0; i--) {
         const n = nodes[i];
-        if (n.tier === 'hidden' && (n.fade ?? 0) <= 0.05) { continue; }   // invisible
+        if (n.tier === 'shadow' && (n.fade ?? 0) <= 0.05) { continue; }   // invisible
         const s = toScreen(n);
         const rr = radiusOf(n) + 4;
         if ((px - s.x) ** 2 + (py - s.y) ** 2 <= rr * rr) { return n; }
@@ -1206,10 +1284,10 @@ export class GraphSideView {
       return null;
     }
 
-    // Reveal the hovered node's hidden (+2-deep) neighbours by fading them in at the
+    // Reveal the hovered node's shadow (+2-deep) neighbours by fading them in at the
     // slots the layout already reserved for them. Moving away fades them back out.
     function updateReveal() {
-      const next = new Set();          // hidden neighbours to reveal
+      const next = new Set();          // shadow neighbours to reveal
       const ctx2 = new Set();          // full hover context (hovered node + all neighbours)
       if (hoverNode) {
         ctx2.add(hoverNode.id);
@@ -1218,13 +1296,34 @@ export class GraphSideView {
           if (!other) { continue; }
           ctx2.add(other);
           const n = nodeMap.get(other);
-          if (n && n.tier === 'hidden') { next.add(n.id); }
+          if (n && n.tier === 'shadow') { next.add(n.id); }
         }
       }
       hoverSet = ctx2;
       if (next.size === revealed.size && [...next].every(id => revealed.has(id))) { return; }
       revealed = next;
       kickFade();
+    }
+
+    // Lazy-expand on hover. The +2-deep build leaves shadow nodes' own callers/deps
+    // unresolved (they sit one hop past the loaded frontier), so a freshly-hovered
+    // shadow node shows only the incidental edges already in the graph. When the cursor
+    // settles on a not-yet-expanded node, ask the host for its full neighbourhood; the
+    // reply (hoverNeighbourhood) patches in the missing edges so the count and revealed
+    // context become exact. Debounced so skimming across nodes fires nothing.
+    let hoverExpandTimer = null;
+    const hoverExpandPending = new Set();   // uris with a request in flight
+    function maybeHoverExpand() {
+      if (hoverExpandTimer) { clearTimeout(hoverExpandTimer); hoverExpandTimer = null; }
+      const n = hoverNode;
+      if (!n || n.expanded || hoverExpandPending.has(n.uri)) { return; }
+      hoverExpandTimer = setTimeout(() => {
+        hoverExpandTimer = null;
+        if (hoverNode === n && !n.expanded && !hoverExpandPending.has(n.uri)) {
+          hoverExpandPending.add(n.uri);
+          vscode.postMessage({ command: 'hoverExpand', uri: n.uri });
+        }
+      }, 140);
     }
 
     canvas.addEventListener('mousedown', e => {
@@ -1242,7 +1341,7 @@ export class GraphSideView {
       else if (panning && last) { anim = null; view.x += dx; view.y += dy; draw(); }
       last = { x: e.offsetX, y: e.offsetY };
       const hit = pick(e.offsetX, e.offsetY);
-      if (hit !== hoverNode) { hoverNode = hit; canvas.style.cursor = hit ? 'pointer' : 'default'; updateReveal(); updateStatus(); draw(); }
+      if (hit !== hoverNode) { hoverNode = hit; canvas.style.cursor = hit ? 'pointer' : 'default'; updateReveal(); maybeHoverExpand(); updateStatus(); draw(); }
     });
 
     window.addEventListener('mouseup', () => {
@@ -1285,27 +1384,12 @@ export class GraphSideView {
       draw(); scheduleSave();
     }, { passive: false });
 
-    function reflectPersist() {
-      btnPersist.classList.toggle('active', persist);
-    }
-    btnPersist.addEventListener('click', () => {
-      persist = !persist;
-      reflectPersist();
-      scheduleSave();
-      // Turning persist OFF collapses the accumulated map back to just the active
-      // selection + 1 hop. Turning it ON keeps the current map and starts growing.
-      if (!persist) {
-        const active = activeId ? nodeMap.get(activeId) : null;
-        if (active) { requestBuild(active.uri); }
-      }
-    });
-
-    new MutationObserver(() => draw()).observe(document.body, {
+    new MutationObserver(() => { refreshTheme(); draw(); }).observe(document.body, {
       attributes: true, attributeFilter: ['data-vscode-theme-kind', 'data-vscode-theme-name', 'class'],
     });
 
     // initial paint of any restored map
-    reflectPersist();
+    refreshTheme();
     handleResize();
     if (nodeMap.size) { hideIntro(); updateStatus(); playIntro(); }
     else { showIntro(true); }   // animated loading screen until javaReady/build resolves

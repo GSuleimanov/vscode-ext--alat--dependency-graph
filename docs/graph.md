@@ -58,8 +58,12 @@ centred, faded context nodes fan out to the sides.
 ## Where it lives in the code
 
 `layeredLayout()` in [`src/commands/graphView.ts`](../src/commands/graphView.ts),
-phases labelled `1) … 4)`. It runs in the default *ephemeral* view; *persist*
-mode uses an incremental force pass to keep accumulated nodes stable.
+phases labelled `1) … 4)`. It lays out every view, re-running on each rebuild as
+the selection moves.
+
+For the vocabulary used throughout the graph code and docs — *selected node*,
+*active*/*inactive*/*shadow* nodes, and the `Nd`/`Nc` depth notation — see
+[`terminology.md`](terminology.md).
 
 ## References
 
