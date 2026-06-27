@@ -17,24 +17,26 @@ Press **`Shift+Alt+F12`** on any Java symbol to open the **Codenav References** 
 
 ### 🕸️ Explorable class graph
 
-Run **`Codenav: Open Project Graph`** from the command palette — or click the graph icon in the **Codenav References** title bar — to open the graph as an editor tab. The graph builds around whichever class is currently active:
+Run **`Codenav: Open Project Graph`** from the command palette — or click the graph icon in the **Codenav References** title bar — to open the graph as an editor tab. It centres on whichever class is active and shows its immediate neighbourhood:
 
 ```
-  [ CallerA ]     [ CallerB ]        ← classes that inject this class as a field
-         ↓               ↓
-  [ SiblingImpl ]  [ ActiveClass ]  [ OtherSiblingImpl ]   ← siblings share same parent
-                         ↓
-  [ FieldDepA ]  [ FieldDepB ]  [ ParentClass ]            ← what this class uses
+  [ CallerA ]   [ CallerB ]      ← classes that use this class
+         ↘         ↙
+        [ ActiveClass ]          ← the selected class, centred
+         ↙         ↘
+  [ FieldDepA ]  [ FieldDepB ]   ← classes this one uses
 ```
 
-The graph is a **persistent, explorable map** rather than a snapshot:
-
-- **Stable coordinates** — every class keeps its place once drawn. Switching editors or hiding the panel never reshuffles the map; the camera simply pans to the active class. The layout is remembered across reloads.
-- **Single-click** a node to make it active — the camera glides to it and its neighbourhood (callers, dependencies, siblings) expands in place, growing the map one region at a time.
-- **Double-click** a node to jump to that class in the editor.
-- **Reset** collapses the map back to just the current class.
+- **Focused by default** — selecting a class shows just it plus one hop (callers above, dependencies below), with the next hop out drawn faded for context. Pick another class and the view smoothly re-centres, keeping shared nodes in place.
+- **Single-click** a node to focus it — the camera glides over and the file opens in a **preview** tab, so you can keep clicking around without losing your place.
+- **Double-click** to open the file for real (pinned tab, focus moves to the editor).
+- **Hover** any node to switch context to it — its connections light up as active while everything else dims.
+- **Persist** (toggle, bottom-right) keeps every visited class on one growing map instead of replacing the view each time.
 
 It renders in stages for instant feedback — the active class and its field dependencies appear in milliseconds (tree-sitter), callers and siblings fill in as the language server responds.
+
+The graph is positioned with a **Sugiyama-style layered layout** — cycles are broken into a DAG, each class is ranked into a row by **longest-path layer assignment** (so layout depth reflects true dependency depth), edge crossings are minimized with the median heuristic, and a tier-aware coordinate pass keeps the selected class and its neighbours centred. See [docs/graph.md](docs/graph.md) for the algorithm and references.
+
 
 #### How the hybrid engine works
 
@@ -54,11 +56,11 @@ This means the graph never scans the whole workspace on load. It reads exactly o
 | --- | --- |
 | Filtered Find References | `Shift+Alt+F12` on a Java symbol |
 | Open Project Graph | Command Palette → `Codenav: Open Project Graph`, or the graph icon in the References title bar |
-| Explore the graph | Single-click a node to focus & expand it · double-click to open the file · **Reset** to collapse to the current class |
+| Explore the graph | Single-click to focus + preview · double-click to open the file · hover to switch context to a node · **Persist** to keep the whole map |
 
-The References panel appears in the VSCode bottom panel area (for a better experience put it on the Secondary panel). The Project Graph opens as an editor tab, so it sits beside your code.
-I preffer `Shift+CMD+Enter` for a fluent experience: (`CMD+Enter` - go to definition with fallback to references), and adding `Shift` to that - you get better usage map.
-Once Codenav References is focused, you can scroll through the references using arrows. Enter will jump the cursor to the file, Esc will return to the place from where you invoked Codenav References.
+The References panel lives in the VSCode bottom panel area (for a better experience move it to the Secondary panel); the Project Graph opens as an editor tab, so it sits beside your code.
+
+Tip: bind `Shift+Cmd+Enter` for a fluent flow — `Cmd+Enter` goes to definition (falling back to references), and adding `Shift` opens the usage map. Once the References panel is focused, arrow through results, **Enter** jumps the cursor to the file, and **Esc** returns to where you invoked it.
 
 ## Configuration
 
