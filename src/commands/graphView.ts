@@ -5,7 +5,7 @@ import { FocusedGraphNode, FocusedGraphEdge } from '../graph/data/focusedGraphTy
 import { bumpEpoch, invalidateExpansion } from '../graph/data/expansionCache';
 import { providerForUri } from '../graph/lang/registry';
 
-// Side-effect import: registers language providers (java, python).
+// Side-effect import: registers all language providers.
 import '../graph/lang';
 
 /**
@@ -22,7 +22,7 @@ export class GraphSideView {
 
   private panel?: vscode.WebviewPanel;
   private cancelCurrent?: () => void;
-  private javaReady = false;
+  private languageReady = false;
   private buildSeq = 0;
 
   constructor(private readonly context: vscode.ExtensionContext) {
@@ -70,11 +70,11 @@ export class GraphSideView {
     panel.webview.postMessage({ command: 'playIntro' });
   }
 
-  /** Called from extension.ts once the Java language server is ready. */
-  setJavaReady(ready: boolean): void {
-    this.javaReady = ready;
+  /** Called from extension.ts once the language providers are ready. */
+  setLanguageReady(ready: boolean): void {
+    this.languageReady = ready;
     if (!this.panel) { return; }
-    this.panel.webview.postMessage({ command: 'javaReady', ready });
+    this.panel.webview.postMessage({ command: 'languageReady', ready });
     if (ready) { this.postActiveFile(); }
   }
 
@@ -108,8 +108,8 @@ export class GraphSideView {
     panel.webview.onDidReceiveMessage(async (msg) => {
       switch (msg.command) {
         case 'ready':
-          panel.webview.postMessage({ command: 'javaReady', ready: this.javaReady });
-          if (this.javaReady) { this.postActiveFile(); }
+          panel.webview.postMessage({ command: 'languageReady', ready: this.languageReady });
+          if (this.languageReady) { this.postActiveFile(); }
           break;
         case 'requestBuild':
           if (msg.uri) { void this.runTieredBuild(vscode.Uri.parse(msg.uri)); }
@@ -292,7 +292,7 @@ export class GraphSideView {
           <circle class="introNode n6" cx="96" cy="98" r="5"/>
         </g>
       </svg>
-      <p id="introMsg">Open a Java class to explore its graph</p>
+      <p id="introMsg">Open a file to explore its graph</p>
     </div>
     <div id="progress"><span class="spinner"></span><span id="progressText"></span></div>
   </div>
@@ -380,8 +380,8 @@ export class GraphSideView {
     let view = { x: 0, y: 0, scale: 1 };
 
     // transient
-    let javaReady = false;
-    let pendingActive = null;         // uri awaited until java is ready
+    let languageReady = false;
+    let pendingActive = null;         // uri awaited until language providers are ready
     let currentSeqId = -1;           // newest in-flight build seqId; older stages ignored
     let buildRootId = null;           // id the current active build's neighbours hang off
     let hoverNode = null;
@@ -1039,7 +1039,7 @@ export class GraphSideView {
     }
 
     function focusFile(uri) {
-      if (!javaReady) { pendingActive = uri; return; }
+      if (!languageReady) { pendingActive = uri; return; }
       const n = findByUri(uri);
       // If already the active-and-expanded centre, just pan — no rebuild needed.
       if (n && n.id === activeId && n.expanded) { setActive(n); }
@@ -1048,10 +1048,10 @@ export class GraphSideView {
     // ── message handling ───────────────────────────────────────────────────────
     window.addEventListener('message', ({ data: msg }) => {
       if (msg.command === 'playIntro') { playIntro(); return; }
-      if (msg.command === 'javaReady') {
-        javaReady = msg.ready;
+      if (msg.command === 'languageReady') {
+        languageReady = msg.ready;
         if (!msg.ready) {
-          if (nodeMap.size === 0) { setIntroMsg('Waiting for the Language Server Provider…'); showIntro(true); }
+          if (nodeMap.size === 0) { setIntroMsg('Loading language support…'); showIntro(true); }
         } else {
           if (nodeMap.size === 0) { setIntroMsg('Open a file to explore its graph'); showIntro(true); }
           if (pendingActive) { const u = pendingActive; pendingActive = null; focusFile(u); }
@@ -1392,7 +1392,7 @@ export class GraphSideView {
     refreshTheme();
     handleResize();
     if (nodeMap.size) { hideIntro(); updateStatus(); playIntro(); }
-    else { showIntro(true); }   // animated loading screen until javaReady/build resolves
+    else { showIntro(true); }   // animated loading screen until languageReady/build resolves
     draw();
 
     vscode.postMessage({ command: 'ready' });

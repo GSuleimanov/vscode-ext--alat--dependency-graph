@@ -1,7 +1,7 @@
 {
   "name": "vscode-codenav-extension",
-  "displayName": "Codenav for Java",
-  "description": "Enhanced navigation and visualization for Java projects in VSCode",
+  "displayName": "Codenav",
+  "description": "Enhanced code navigation and dependency-graph visualization in VSCode",
   "version": "0.1.1",
   "publisher": "gsuleimanov",
   "license": "Apache-2.0",
@@ -22,7 +22,7 @@
     "Other"
   ],
   "activationEvents": [
-    "onLanguage:java"
+    "onStartupFinished"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -33,65 +33,7 @@
         "category": "Codenav",
         "icon": "$(circuit-board)"
       }
-    ],
-    "configuration": {
-      "title": "Codenav",
-      "properties": {
-        "codenav.testSourceRoots": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "default": [
-            "src/test/",
-            "src/it/",
-            "src/integration-test/"
-          ],
-          "description": "Path segments identifying test source roots. References whose file path contains any of these are excluded from filtered peek."
-        },
-        "codenav.testFilePatterns": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "default": [
-            "Test.java",
-            "Tests.java",
-            "TestCase.java",
-            "Spec.java"
-          ],
-          "description": "Filename suffixes (fallback) for identifying test files not under a configured test source root."
-        },
-        "codenav.filterImports": {
-          "type": "boolean",
-          "default": true,
-          "description": "Exclude import statement references from filtered peek by default."
-        },
-        "codenav.includeTests": {
-          "type": "boolean",
-          "default": false,
-          "description": "Include references from test sources in filtered peek by default."
-        },
-        "codenav.hideDefinitions": {
-          "type": "boolean",
-          "default": false,
-          "description": "Hide the Definitions section in filtered peek results by default."
-        },
-        "codenav.currentClassOnly": {
-          "type": "boolean",
-          "default": false,
-          "description": "Limit filtered peek to references within the current class (faster). Toggle off in the panel to load whole-project references on demand."
-        },
-        "codenav.includePackagePrefixes": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "default": [],
-          "description": "Package prefixes whose library results to include in filtered peek, in addition to this project's own files (e.g. \"com.gsuleimanov\"). Anything not in the project and not matching a prefix here (JDK, third-party libs) is neither shown nor searched."
-        }
-      }
-    }
+    ]
   },
   "scripts": {
     "vscode:prepublish": "npm run build",
@@ -100,16 +42,12 @@
     "dev": "node esbuild.js --watch",
     "compile": "tsc --noEmit",
     "test": "node --require ts-node/register --test src/commands/__tests__/**/*.test.ts",
-    "cucumber": "cucumber-js",
-    "build:e2e": "npm run build && tsc -p tsconfig.e2e.json",
-    "pretest:e2e": "npm run build:e2e",
-    "test:e2e": "node out-e2e/test/e2e/runTest.js"
+    "cucumber": "cucumber-js"
   },
   "devDependencies": {
     "@cucumber/cucumber": "^10.3.0",
     "@types/node": "^20.0.0",
     "@types/vscode": "^1.63.0",
-    "@vscode/test-electron": "^2.3.0",
     "esbuild": "^0.20.0",
     "ts-node": "^10.9.0",
     "typescript": "^5.3.0"

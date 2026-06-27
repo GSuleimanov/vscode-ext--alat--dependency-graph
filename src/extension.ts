@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { GraphSideView } from './commands/graphView';
+import { initProviders } from './graph/lang';
 
 export function activate(context: vscode.ExtensionContext): void {
   const graphView = new GraphSideView(context);
@@ -8,23 +9,22 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('codenav.openGraph', () => graphView.reveal())
   );
 
-  void signalJavaReadiness(graphView);
+  void signalLanguageReadiness(graphView);
 }
 
-async function signalJavaReadiness(graphView: GraphSideView): Promise<void> {
-  const ext = vscode.extensions.getExtension('redhat.java');
-  if (!ext) {
-    graphView.setJavaReady(true);
-    return;
-  }
+/**
+ * Readiness is provider-driven: once every registered language provider's tree-sitter
+ * grammar is loaded, the graph can parse any supported file. Callers/siblings come from
+ * whatever language server VSCode has for that file (resolved per-query, not hardcoded
+ * to any one extension), so no single LSP is gated on here.
+ */
+async function signalLanguageReadiness(graphView: GraphSideView): Promise<void> {
   try {
-    if (!ext.isActive) { await ext.activate(); }
-    const api = ext.exports as { serverReady?: () => Promise<boolean> } | undefined;
-    if (api?.serverReady) { await api.serverReady(); }
-    graphView.setJavaReady(true);
+    await initProviders();
   } catch {
-    /* leave graph showing "starting" if readiness can't be determined */
+    /* grammars may still load lazily on first parse */
   }
+  graphView.setLanguageReady(true);
 }
 
 export function deactivate(): void {}

@@ -37,7 +37,7 @@ export interface ParsedType {
   uri: string;
   line: number;
   kind: TypeKind;
-  extendsNames: string[];    // simple names referenced in `extends` (Python: base classes)
+  extendsNames: string[];    // simple names of supertypes / base classes
   implementsNames: string[]; // simple names referenced in `implements`
   fieldTypes: string[];      // simple type names used in field/param/return positions
   annotations?: string[];    // simple annotation / decorator names on the declaration

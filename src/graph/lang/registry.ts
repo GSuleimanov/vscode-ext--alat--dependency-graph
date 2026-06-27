@@ -19,10 +19,11 @@ export interface RoleRule {
 }
 
 // A language strategy: selected by file extension. Parsing is encapsulated here
-// (tree-sitter grammar per language), swappable without touching callers.
+// (tree-sitter grammar per language), swappable without touching callers. The
+// `id` matches the VSCode languageId for the language (e.g. 'java', 'python').
 export interface LanguageProvider {
   id: string;
-  extensions: string[];   // ['.java']
+  extensions: string[];   // e.g. ['.java']
   include: string;        // vscode.workspace.findFiles include glob
   exclude: string;        // findFiles exclude glob
   // One-time async grammar load. Must be awaited before parse().
@@ -43,6 +44,11 @@ export function allProviders(): LanguageProvider[] {
 export function providerForUri(uri: string): LanguageProvider | undefined {
   const lower = uri.toLowerCase();
   return providers.find(p => p.extensions.some(ext => lower.endsWith(ext)));
+}
+
+/** Await every registered provider's one-time grammar load. Idempotent. */
+export async function initProviders(): Promise<void> {
+  await Promise.all(providers.map(p => p.init()));
 }
 
 /**

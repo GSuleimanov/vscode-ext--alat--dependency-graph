@@ -14,36 +14,26 @@ npm run cucumber    # Cucumber BDD scenarios (all steps currently pending)
 
 Run a single test file:
 ```bash
-node --require ts-node/register --test src/commands/__tests__/expandViaType.test.ts
+node --require ts-node/register --test src/commands/__tests__/tieredGraphBuilder.test.ts
 ```
 
 ## Architecture
 
-This is a VSCode extension (`src/extension.ts` is the entry point) that enhances Java reference navigation. The extension is bundled with esbuild — `vscode` is external and injected at runtime.
+This is a VSCode extension (`src/extension.ts` is the entry point) that enhances code reference navigation and dependency-graph visualization. It is language-agnostic: each language is a `LanguageProvider` registered in `src/graph/lang/` (tree-sitter for parsing, the file's own VSCode language server for callers/references). The extension is bundled with esbuild — `vscode` is external and injected at runtime.
 
 ### Core data flow
 
-1. **Command trigger** (`src/commands/filteredPeek.ts`) — `Shift+Alt+F12` on a Java symbol fires `codenav.findReferences`. It calls four VSCode LSP providers in parallel (references, type definitions, definitions, implementations), then runs `expandViaTypeDefinitions` to widen the result set.
+1. **Activation** (`src/extension.ts`) — registers the `codenav.openGraph` command and awaits `initProviders()` (loads every registered language grammar), then signals readiness to the graph view. Readiness is provider-driven; no single language server is gated on. Callers/references are resolved per-file via whatever VSCode language server handles that file.
 
-2. **Type expansion** (`src/commands/expandViaType.ts`) — Pure logic (no VSCode imports) with an injected `TypeExpansionExecutor`. Given a symbol's type definition location, it:
-   - Fetches cross-file locations that reference the type (field declarations in other classes)
-   - Classifies each: if `executeDefinitionProvider` at that location points back to the type → it's a field declaration → added to `defLocations`
-   - Runs `executeReferenceProvider` at the **variable name column** (not the type name column) of each field declaration to get method-call usages
-   - Deduplicates by `uri:line` throughout
-   
-   This ensures calling on an instance variable (`profileRepository`) shows the same cross-file usages as calling on the type name (`ProfileRepository`).
+2. **Graph view** (`src/commands/graphView.ts`) — `GraphSideView` owns the webview panel and acts as a stateless build service: on active-editor change it tells the webview which file is current; the webview pans to it if already mapped or asks for a build otherwise. All rendering and layout live in the webview's inline `<script>`.
 
-3. **Side panel** (`src/views/referencesSideView.ts`) — `WebviewViewProvider` that renders results in the VSCode panel. Receives a `PanelInput` and rebuilds HTML via `postMessage`. On `buildData`, raw locations are deduped by `uri:line` (LSP can return multiple locations per line for multiple symbol occurrences), then classified and grouped as: Type Definitions → Definitions → Implementations → References → Tests.
-
-4. **Classification** (`src/util/locationClassifier.ts`) — Pure function, key-based: a location is a "definition" only if its `fsPath:line` is in the `defLocs` set passed in. No heuristics.
-
-5. **Filtering** (`src/util/javaUtils.ts`) — Strips import statements and test-source locations from the reference list before display.
+The graph build pipeline itself is documented under **Graph data flow & the tiered build** below.
 
 ### Key design constraints
 
-- `expandViaType.ts` uses a `Loc` interface (minimal subset of `vscode.Location`) so it can be unit-tested without VSCode. Cast to/from `vscode.Location[]` happens only in `filteredPeek.ts`.
-- The webview has strict CSP (`default-src 'none'`) with nonce-gated scripts and styles.
-- All keyboard navigation and preview logic lives in the inline `<script>` of `buildHtml()` in `referencesSideView.ts`. Preview fires only on keyboard arrow selection (not hover). Hover only highlights via CSS `:hover`.
+- The webview owns the node map (coordinates, tiers) as a persistent, accumulating state across reloads.
+- All keyboard/mouse interaction, layout, and drawing live in the inline `<script>` of `getHtml()` in `graphView.ts`.
+- The pure, VSCode-free builders (`graph/data/tieredGraphBuilder.ts`, `graph/core/*`) are unit-tested with fake projects.
 
 ## Graph terminology
 

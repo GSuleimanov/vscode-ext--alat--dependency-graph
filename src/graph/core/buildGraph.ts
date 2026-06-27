@@ -2,13 +2,14 @@ import { Graph, GraphEdge, GraphNode, ParsedType, EdgeKind } from './types';
 import { Tags } from './tags';
 
 // Cross-cutting role: a test type, detected by source path/name regardless of
-// language. Applied during node build so it composes with language tags.
+// language. Applied during node build so it composes with language tags. Extension
+// is left unconstrained so the same conventions work across languages.
 const TEST_PATH = /\/(test|tests|it|integration-test)\//i;
-const TEST_FILE = /(Test|Tests|TestCase|Spec|IT)\.(java|py)$/;
-const TEST_PY = /(^|\/)test_[\w]+\.py$/;
+const TEST_FILE = /(Test|Tests|TestCase|Spec|IT)\.[A-Za-z0-9]+$/;
+const TEST_PREFIX = /(^|\/)test_[\w]+\.[A-Za-z0-9]+$/;
 
 function isTestUri(uri: string): boolean {
-  return TEST_PATH.test(uri) || TEST_FILE.test(uri) || TEST_PY.test(uri);
+  return TEST_PATH.test(uri) || TEST_FILE.test(uri) || TEST_PREFIX.test(uri);
 }
 
 /**
