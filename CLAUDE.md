@@ -23,7 +23,7 @@ This is a VSCode extension (`src/extension.ts` is the entry point) that enhances
 
 ### Core data flow
 
-1. **Activation** (`src/extension.ts`) — registers the `codenav.openGraph` command and awaits `initProviders()` (loads every registered language grammar), then signals readiness to the graph view. Readiness is provider-driven; no single language server is gated on. Callers/references are resolved per-file via whatever VSCode language server handles that file.
+1. **Activation** (`src/extension.ts`) — registers the `alat.openDependencyGraph` command and awaits `initProviders()` (loads every registered language grammar), then signals readiness to the graph view. Readiness is provider-driven; no single language server is gated on. Callers/references are resolved per-file via whatever VSCode language server handles that file.
 
 2. **Graph view** (`src/commands/graphView.ts`) — `GraphSideView` owns the webview panel and acts as a stateless build service: on active-editor change it tells the webview which file is current; the webview pans to it if already mapped or asks for a build otherwise. All rendering and layout live in the webview's inline `<script>`.
 

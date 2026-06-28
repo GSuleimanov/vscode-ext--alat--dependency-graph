@@ -1,6 +1,6 @@
 {
-  "name": "vscode-codenav-extension",
-  "displayName": "Codenav — Code Dependency Graph & Visualization",
+  "name": "alat-dependency-graph",
+  "displayName": "Alat / Dependency Graph",
   "description": "Visualize your codebase as an interactive dependency graph. Explore call graphs, class diagrams, and code structure for any language.",
   "keywords": [
     "dependency graph",
@@ -16,7 +16,7 @@
     "visualization",
     "code analysis"
   ],
-  "version": "0.1.1",
+  "version": "0.2.1",
   "publisher": "gsuleimanov",
   "license": "Apache-2.0",
   "icon": "images/codenav-logo.png",
@@ -43,9 +43,9 @@
   "contributes": {
     "commands": [
       {
-        "command": "codenav.openGraph",
-        "title": "Open Project Graph",
-        "category": "Codenav",
+        "command": "alat.openDependencyGraph",
+        "title": "Open Dependency Graph",
+        "category": "Alat",
         "icon": "$(circuit-board)"
       }
     ]

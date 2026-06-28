@@ -18,7 +18,7 @@ import '../graph/lang';
  * build only when the class is new or unexpanded.
  */
 export class GraphSideView {
-  static readonly viewId = 'codenav.graphView';
+  static readonly viewId = 'alat.dependencyGraphView';
 
   private panel?: vscode.WebviewPanel;
   private cancelCurrent?: () => void;
@@ -90,7 +90,7 @@ export class GraphSideView {
 
     const panel = vscode.window.createWebviewPanel(
       GraphSideView.viewId,
-      'Codenav Graph',
+      'Alat: Dependency Graph',
       { viewColumn: vscode.ViewColumn.Beside, preserveFocus: true },
       { enableScripts: true, retainContextWhenHidden: true }
     );
@@ -240,7 +240,7 @@ export class GraphSideView {
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Codenav Graph</title>
+  <title>Alat: Dependency Graph</title>
   <style>
     html, body { margin: 0; padding: 0; }
     *, *::before, *::after { box-sizing: border-box; }

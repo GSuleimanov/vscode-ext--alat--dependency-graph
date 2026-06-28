@@ -1,4 +1,4 @@
-# Codenav Graph Terminology
+# Alat Graph Terminology
 
 Shared vocabulary for the Project Graph — used in code comments, docs, and commit
 messages. When in doubt, use these words.

@@ -1,6 +1,6 @@
-# Codenav Graph Layout
+# Alat Graph Layout
 
-How Codenav positions classes in the Project Graph — and the established
+How Alat positions classes in the Project Graph — and the established
 computer-science it is built on.
 
 ## What it is, scientifically
@@ -44,12 +44,12 @@ several iterations.
 `y = layer × row-height`. Horizontal positions come from an iterative
 **priority/barycenter** pass (a lightweight cousin of **Brandes–Köpf**): pull each
 node toward the average x of its neighbours, then enforce a minimum per-row gap.
-Codenav makes this **tier-aware** — the active subgraph is packed tight and
+Alat makes this **tier-aware** — the active subgraph is packed tight and
 centred, faded context nodes fan out to the sides.
 
 ## One-line pitch
 
-> Codenav lays out the dependency graph with a **Sugiyama-style layered
+> Alat lays out the dependency graph with a **Sugiyama-style layered
 > algorithm**: it breaks cycles into a DAG, assigns each class a **layer via
 > longest-path ranking** (so layout depth reflects true dependency depth),
 > minimizes crossings with the **median heuristic**, and places coordinates with

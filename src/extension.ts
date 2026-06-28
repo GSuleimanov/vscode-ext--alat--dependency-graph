@@ -6,7 +6,7 @@ export function activate(context: vscode.ExtensionContext): void {
   const graphView = new GraphSideView(context);
 
   context.subscriptions.push(
-    vscode.commands.registerCommand('codenav.openGraph', () => graphView.reveal())
+    vscode.commands.registerCommand('alat.openDependencyGraph', () => graphView.reveal())
   );
 
   void signalLanguageReadiness(graphView);

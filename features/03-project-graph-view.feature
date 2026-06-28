@@ -4,12 +4,12 @@ Feature: Project Graph View
   So that I can understand project structure and navigate efficiently
 
   Background:
-    Given the Codenav extension is active
+    Given the Alat extension is active
     And a Java project is open and indexed by the Java Language Server
 
   Scenario: Open graph view from command palette
     Given any Java file is open in the editor
-    When I invoke "Codenav: Open Project Graph"
+    When I invoke "Alat: Open Dependency Graph"
     Then a new editor panel opens showing the project graph
     And the graph displays packages as clusters and classes as nodes
 
