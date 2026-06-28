@@ -93,13 +93,15 @@ async function resolveTypeUri(name: string): Promise<vscode.Uri | null> {
 }
 
 /**
- * Readiness signal for dependency resolution. Deps are resolved through the workspace
- * symbol index (resolveTypeUri), which indexes the whole project and so warms up later
- * than per-file features like the reference provider. The centre's own class is in the
- * workspace, so if a symbol lookup for its name finds nothing, the index isn't built
- * yet — distinct from "no dependencies" — and the (empty) result must not be cached.
+ * Definitive "is the language server indexed?" probe. The whole project is searched for
+ * the centre's own class — which certainly exists in the workspace — so a non-empty hit
+ * means the server has finished building its index. This is the fallback we fall back on
+ * when a build's emptiness is ambiguous: an empty neighbourhood from an *indexed* server
+ * is genuine (e.g. an API controller nobody calls) and safe to cache, whereas an empty
+ * one from a still-starting server must not be. It is only consulted when cheaper, local
+ * evidence of readiness is absent (see buildFocusedGraph), so most builds never run it.
  */
-async function workspaceSymbolsReady(name: string): Promise<boolean> {
+async function languageServerIndexed(name: string): Promise<boolean> {
   try {
     const symbols = await Promise.resolve(
       vscode.commands.executeCommand<vscode.SymbolInformation[]>(
@@ -118,8 +120,10 @@ interface IntrinsicResult {
   center: FocusedGraphNode;
   deps: Segment;
   parent: ParentRef | null;
-  // false when the symbol index wasn't ready, so the empty deps mustn't be cached.
-  providerReady: boolean;
+  // Did tree-sitter see any declared type references (field types / extends / implements)?
+  // Used as the local readiness signal: declared-but-unresolved deps mean the index is
+  // still building, whereas a class that declares nothing has genuinely empty deps.
+  hadNames: boolean;
 }
 
 /**
@@ -177,14 +181,10 @@ async function computeIntrinsic(uri: vscode.Uri, uriStr: string): Promise<Intrin
     ? { uri: parentRes.uri, name: parentRes.type.name, line: parentRes.type.line }
     : null;
 
-  // Trust the result unless the centre declared type references that ALL failed to
-  // resolve — the tell-tale of a symbol index that hasn't finished building. (When the
-  // centre references nothing, or at least one name resolved, the index is clearly up.)
   const hadNames = centerType.fieldTypes.length
     + centerType.extendsNames.length + centerType.implementsNames.length > 0;
-  const providerReady = depNodes.length > 0 || !hadNames || await workspaceSymbolsReady(center.name);
 
-  return { center, deps: { nodes: depNodes, edges: depEdges }, parent, providerReady };
+  return { center, deps: { nodes: depNodes, edges: depEdges }, parent, hadNames };
 }
 
 /**
@@ -193,16 +193,15 @@ async function computeIntrinsic(uri: vscode.Uri, uriStr: string): Promise<Intrin
  */
 async function computeCallers(
   uri: vscode.Uri, uriStr: string, fileText: string, center: FocusedGraphNode
-): Promise<Segment & { providerReady: boolean }> {
+): Promise<Segment & { refsNonEmpty: boolean }> {
   const namePos = findNamePosition(fileText, center.name, center.line);
   const refs = await execLocs('vscode.executeReferenceProvider', uri, namePos);
 
-  // Readiness signal for caller search: the reference command includes the symbol's own
-  // declaration, so a ready server returns at least that one location even when nothing
-  // external calls the class. Zero locations therefore means the reference provider
-  // isn't available yet (the language server is still starting) — distinct from "no
-  // callers" — and the result must not be cached (see buildFocusedGraph).
-  const providerReady = refs.length > 0;
+  // Raw fact (not a verdict): did the reference provider return anything at all? A ready
+  // server returns at least the declaration even when nothing calls the class — but some
+  // servers omit it, so an empty result here is ambiguous. buildFocusedGraph resolves
+  // that ambiguity (genuinely-uncalled vs. server-not-ready) rather than this function.
+  const refsNonEmpty = refs.length > 0;
 
   const refUriStrings = [...new Set(
     refs
@@ -229,7 +228,7 @@ async function computeCallers(
     nodes.push(toNode(res.type, res.uri, 'caller'));
     edges.push({ from: id, to: center.id, kind: 'calls' });
   }
-  return { nodes, edges, providerReady };
+  return { nodes, edges, refsNonEmpty };
 }
 
 /**
@@ -303,14 +302,13 @@ export async function buildFocusedGraph(
   let center: FocusedGraphNode;
   let deps: Segment;
   let parent: ParentRef | null;
-  let intrinsicReady = true;
+  let hadNames = false;             // tree-sitter saw declared deps (fresh build only)
   if (intrinsicValid) {
     ({ center, deps, parent } = cached!);
   } else {
     const computed = await computeIntrinsic(uri, uriStr);
     if (!computed) { return; }
-    ({ center, deps, parent } = computed);
-    intrinsicReady = computed.providerReady;
+    ({ center, deps, parent, hadNames } = computed);
   }
   if (isCancelled()) { return; }
 
@@ -322,17 +320,14 @@ export async function buildFocusedGraph(
   if (isCancelled()) { return; }
 
   // ── Stage 3: callers (extrinsic) ────────────────────────────────────────────
-  // A cached extrinsic half was resolved when the provider was already ready, so it is
-  // trustworthy. A freshly-computed one carries `providerReady` — false means the
-  // reference provider wasn't available yet and this result must not be cached.
   let callers: Segment;
-  let extrinsicReady = true;
+  let refsNonEmpty = false;         // reference provider returned something (fresh build only)
   if (extrinsicValid) {
     callers = cached!.callers;
   } else {
     const computed = await computeCallers(uri, uriStr, fileText, center);
     callers = { nodes: computed.nodes, edges: computed.edges };
-    extrinsicReady = computed.providerReady;
+    refsNonEmpty = computed.refsNonEmpty;
   }
   if (isCancelled()) { return; }
   if (callers.nodes.length > 0) {
@@ -349,11 +344,25 @@ export async function buildFocusedGraph(
     onStage({ stage: 'siblings', nodes: siblings.nodes, edges: siblings.edges });
   }
 
-  // Don't persist a neighbourhood resolved before its language providers were ready —
-  // the empty deps (symbol index) or callers (reference provider) would stick, replayed
-  // on every re-select, until a save invalidates it. The two halves warm up at different
-  // times, so the cache is gated on BOTH being ready; that a node was NOT cached is also
-  // the signal the host uses to retry (see GraphSideView.runTieredBuild).
+  // ── Readiness verdict: should this be cached? ───────────────────────────────
+  // A neighbourhood resolved before the language server finished indexing would have
+  // wrongly-empty deps/callers; cached, that emptiness would stick (replayed on every
+  // re-select) until a save invalidates it, and the host would keep showing the loading
+  // screen. So cache only once the server is provably ready. Crucially, "empty" is NOT
+  // "not ready": an API controller legitimately has zero callers. We therefore decide
+  // from positive evidence, preferring cheap local signals and only probing the index as
+  // a last resort (so a warm build never pays for it):
+  //   • a half that came from cache is already trustworthy;
+  //   • any resolved dep proves the symbol index is up (so callers are too — that
+  //     subsystem comes up no later);
+  //   • any returned reference proves the reference provider is up;
+  //   • a class that declares no deps has genuinely-empty deps, not a stalled index;
+  //   • otherwise the emptiness is ambiguous — fall back to the index probe.
+  let indexedMemo: boolean | undefined;
+  const indexed = async () => indexedMemo ??= await languageServerIndexed(center.name);
+  const depsResolved = deps.nodes.length > 0;
+  const intrinsicReady = intrinsicValid || depsResolved || !hadNames || await indexed();
+  const extrinsicReady = extrinsicValid || refsNonEmpty || depsResolved || await indexed();
   if (intrinsicReady && extrinsicReady) {
     setExpansion(uriStr, { ownHash, epoch, center, deps, parent, callers, siblings });
   }
