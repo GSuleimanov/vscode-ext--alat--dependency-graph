@@ -30,6 +30,12 @@ Two consequences fall out of this approach:
   A node expanded once is replayed from cache — no LSP — so a large graph stabilises after one pass and clicking
   the same node always yields the same neighbourhood.
 
+---
+
+## Problem #2: visualization
+
+Visualizing a graph isn't difficult, but making sense of it is. There are many possibilities, but I needed a balance between functionality and usability. After many iterations and research, I settled on a structure I'm happy with.
+
 Focus a class and the graph centres on it, with relationships flowing top-to-bottom:
 
 ```
@@ -39,12 +45,6 @@ Focus a class and the graph centres on it, with relationships flowing top-to-bot
                  ↙          ↘
          [ Dependency ]  [ Parent ]       ← what it uses / inherits  (tree-sitter + LSP)
 ```
-
----
-
-## Problem #2: visualization
-
-Visualizing a graph isn't difficult, but making sense of it is. There are many possibilities, but I needed a balance between functionality and usability. After many iterations and research, I settled on a structure I'm happy with.
 
 The view is organised as **rings** of relevance around the focus:
 
