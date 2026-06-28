@@ -16,7 +16,7 @@
     "visualization",
     "code analysis"
   ],
-  "version": "0.4.0",
+  "version": "0.5.0",
   "publisher": "gsuleimanov",
   "license": "Apache-2.0",
   "icon": "images/alat-dependency-graph-icon-256x256.png",
