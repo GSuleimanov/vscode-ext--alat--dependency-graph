@@ -6,6 +6,8 @@ I build it for myself, and polished it to be used by fellow engineers.
 It's **language-agnostic by design** and renders in **milliseconds**, because of
 how it's built.
 
+![Dependency Graph preview](images/alat-dependency-graph-preview.gif)
+
 ## The first problem: Parsing
 
 There are several tools that allows to show connections between components, each with their pros and cons. 
