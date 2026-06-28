@@ -6,7 +6,7 @@ I build it for myself, and polished it to be used by fellow engineers.
 It's **language-agnostic by design** and renders in **milliseconds**, because of
 how it's built.
 
-## Problem #1: parsing
+## The first problem: Parsing
 
 There are several tools that allows to show connections between components, each with their pros and cons. 
 Here I used hybrid approach to take best of each:
@@ -32,7 +32,7 @@ Two consequences fall out of this approach:
 
 ---
 
-## Problem #2: visualization
+## The second problem: Visualization
 
 Visualizing a graph isn't difficult, but making sense of it is. There are many possibilities, but I needed a balance between functionality and usability. After many iterations and research, I settled on a structure I'm happy with.
 
@@ -104,9 +104,30 @@ while the view re-flows around the new focus.
 
 ## Languages
 
-The extension is language-agnostic through a pluggable provider registry — each language
-contributes a tree-sitter grammar and a set of role rules, with no changes to the
-graph engine or layout.
+The extension is language-agnostic through a pluggable provider registry. The graph
+engine and layout doesn't change per language - a language only contributes how a file
+is read. There are two kinds of contribution:
+
+- **Generic providers** - a declarative spec (a tree-sitter query + a few options). For most languages that's enough. To add one - just another entry in [`src/graph/lang/generic/specs.ts`](src/graph/lang/generic/specs.ts).
+- **Dedicated providers** - hand-written for languages that want richer structure (nested-type qualification, member-level annotations). Java and Python use these.
+
+Out of the box:
+
+| Language | Extensions | Provider | Notes |
+|---|---|---|---|
+| Java | `.java` | dedicated | nested types, Spring / Jakarta / Lombok role rules |
+| Python | `.py` | dedicated | decorators, Pydantic role rules |
+| TypeScript | `.ts` `.mts` `.cts` | generic | classes, interfaces, enums, decorators |
+| TSX | `.tsx` | generic | same as TypeScript, JSX-aware grammar |
+| JavaScript | `.js` `.jsx` `.mjs` `.cjs` | generic | `extends` + `new X()` dependencies |
+| Go | `.go` | generic | structs → classes, interfaces; field-type edges |
+| C# | `.cs` | generic | classes, interfaces, enums, attributes, namespaces |
+| C++ | `.cpp` `.cc` `.cxx` `.hpp` `.hh` `.hxx` | generic | classes, structs, enums, base-class edges |
+| C | `.c` `.h` | generic | structs, enums, struct-typed field edges |
+
+### Adding a language
+
+`LangSpec` with a tree-sitter query whose captures (`@def.class`, `@name`, `@extends`, `@implements`, `@uses`, `@annotation`, `@import`, `@package`) the shared provider turns into graph nodes and edges. The capture vocabulary is documented in [`src/graph/lang/generic/provider.ts`](src/graph/lang/generic/provider.ts). Framework-specific "sugar" (e.g. Spring stereotypes → service/controller roles) layers on as optional `RoleRule`s, independent of parsing.
 
 ## Requirements
 

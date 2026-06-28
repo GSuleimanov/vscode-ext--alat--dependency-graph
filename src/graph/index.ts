@@ -6,6 +6,8 @@ export { parseCached, clearParseCache } from './core/cache';
 export { allProviders, providerForUri, type LanguageProvider } from './lang/registry';
 export { parseJavaSource, javaProvider } from './lang/java/provider';
 export { parsePythonSource, pythonProvider } from './lang/python/provider';
+export { makeProvider, type LangSpec } from './lang/generic/provider';
+export { genericSpecs } from './lang/generic/specs';
 
 // Focused graph types (no VSCode — safe for unit tests). The VSCode-dependent
 // modules (focusedGraphBuilder, singleFileParser) are imported directly by

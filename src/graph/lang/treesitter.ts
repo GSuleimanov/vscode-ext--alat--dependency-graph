@@ -37,6 +37,13 @@ export function newParser(id: string): Parser {
   return p;
 }
 
+/** Compile a tree-sitter query against an already-loaded language. Compile once and reuse. */
+export function compileQuery(id: string, source: string): Parser.Query {
+  const lang = languages.get(id);
+  if (!lang) { throw new Error(`tree-sitter language '${id}' not loaded — await loadLanguage first`); }
+  return lang.query(source);
+}
+
 // -- small AST helpers shared by language providers --
 
 /** Direct named child of a given type (not deep). */
