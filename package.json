@@ -79,10 +79,10 @@
     "cucumber": "cucumber-js"
   },
   "devDependencies": {
-    "@cucumber/cucumber": "^13.0.0",
+    "@cucumber/cucumber": "^10.3.0",
     "@types/node": "^20.0.0",
     "@types/vscode": "^1.63.0",
-    "esbuild": "^0.28.1",
+    "esbuild": "^0.20.0",
     "ts-node": "^10.9.0",
     "typescript": "^5.3.0"
   },
