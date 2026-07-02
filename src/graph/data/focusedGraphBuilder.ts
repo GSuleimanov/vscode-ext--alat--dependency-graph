@@ -1,12 +1,18 @@
 // Orchestrates the hybrid graph build: tree-sitter for the current file (instant),
-// LSP for callers and siblings (async, project-wide). Results are emitted stage by
-// stage so the webview can render progressively without for all data.
+// the tree-sitter project index (see projectIndex.ts / indexService.ts) for the
+// project-wide lookups — callers, dependency type resolution, siblings. Results are
+// emitted stage by stage so the webview can render progressively.
 //
-// Stage order and data source:
-//   1. center       — tree-sitter parse of the active file (~5 ms, no LSP)
-//   2. dependencies — workspace-symbol lookup per field type + tree-sitter parse (~50 ms)
-//   3. callers      — LSP reference provider on the class name (~200–500 ms)
-//   4. siblings     — LSP implementation provider on the parent class (~200 ms, optional)
+// Stage order and data source (index warm — each lookup is a Map.get):
+//   1. center       — tree-sitter parse of the active file (~5 ms)
+//   2. dependencies — index.defsOf per field type + tree-sitter parse
+//   3. callers      — index.callerFilesOf on the class name
+//   4. siblings     — index reverse lookup on the parent + inheritance filter
+//
+// The old LSP path (executeWorkspaceSymbolProvider / executeReferenceProvider /
+// executeImplementationProvider) survives behind the `alat.lspFallback` setting,
+// used only when the index misses — off by default, since a server round-trip is
+// 200–500 ms against the index's microseconds.
 //
 // Every expansion is memoized in the expansion cache (see expansionCache.ts). A node
 // expanded once is replayed from cache — no LSP — as long as it stays valid, so a
@@ -23,8 +29,23 @@ import { isTestUri } from '../core/buildGraph';
 import {
   Segment, ParentRef, currentEpoch, getExpansion, setExpansion, hashText,
 } from './expansionCache';
+import { getProjectIndex } from './indexService';
+import { ProjectIndex } from './projectIndex';
 
 type Cancelled = () => boolean;
+
+/** The project index, once its cold build has completed; null before that. */
+function readyIndex(): ProjectIndex | null {
+  const idx = getProjectIndex();
+  return idx?.ready() ? idx : null;
+}
+
+function lspFallbackEnabled(): boolean {
+  return vscode.workspace.getConfiguration('alat').get<boolean>('lspFallback', false);
+}
+
+/** Nested types keep their Outer.Inner name; references use the simple last segment. */
+const simpleName = (name: string) => name.split('.').pop() ?? name;
 
 // ── helpers ────────────────────────────────────────────────────────────────────
 
@@ -84,10 +105,21 @@ function findNamePosition(text: string, name: string, hintLine: number): vscode.
 }
 
 /**
- * Resolve a simple type name to a workspace file URI using the LSP workspace
- * symbol provider. Prefers exact name matches of class/interface/enum kind.
+ * Resolve a simple type name to a workspace file URI. Primary source is the
+ * project index (a Map lookup); the LSP workspace-symbol provider is consulted
+ * only on an index miss when `alat.lspFallback` allows it.
  */
 async function resolveTypeUri(name: string): Promise<vscode.Uri | null> {
+  const idx = readyIndex();
+  if (idx) {
+    const def = idx.defsOf(name)[0] ?? idx.defsOf(simpleName(name))[0];
+    if (def) { return vscode.Uri.parse(def.uri); }
+    if (!lspFallbackEnabled()) { return null; }
+  }
+  return resolveTypeUriLsp(name);
+}
+
+async function resolveTypeUriLsp(name: string): Promise<vscode.Uri | null> {
   try {
     const symbols = await Promise.resolve(
       vscode.commands.executeCommand<vscode.SymbolInformation[]>(
@@ -202,11 +234,62 @@ async function computeIntrinsic(uri: vscode.Uri, uriStr: string): Promise<Intrin
   return { center, deps: { nodes: depNodes, edges: depEdges }, parent, hadNames };
 }
 
+/** Fold per-file caller classes into a deduped segment of caller nodes + edges. */
+function callerSegment(
+  resolutions: ({ type: ParsedType; uri: string } | null)[],
+  center: FocusedGraphNode, refsNonEmpty: boolean
+): Segment & { refsNonEmpty: boolean } {
+  const nodes: FocusedGraphNode[] = [];
+  const edges: FocusedGraphEdge[] = [];
+  const seen = new Set<string>();
+  for (const res of resolutions) {
+    if (!res) { continue; }
+    const id = nodeId(res.uri, res.type.line);
+    if (seen.has(id) || id === center.id) { continue; }
+    seen.add(id);
+    nodes.push(toNode(res.type, res.uri, 'caller'));
+    edges.push({ from: id, to: center.id, kind: 'calls' });
+  }
+  return { nodes, edges, refsNonEmpty };
+}
+
+/** Resolve each caller file to the class it holds (first non-test type). */
+async function callersFromFiles(
+  fileUris: string[], center: FocusedGraphNode, refsNonEmpty: boolean
+): Promise<Segment & { refsNonEmpty: boolean }> {
+  const resolutions = await Promise.all(
+    fileUris.map(async (callerUriStr) => {
+      const callerParsed = await parseSingleFile(vscode.Uri.parse(callerUriStr));
+      const callerType = callerParsed.find(p => !p.tags?.includes('test'));
+      return callerType ? { type: callerType, uri: callerUriStr } : null;
+    })
+  );
+  return callerSegment(resolutions, center, refsNonEmpty);
+}
+
 /**
  * Extrinsic: classes that reference this one (each unique workspace file, excluding
- * the centre, likely holds a caller class). Depends on the whole project.
+ * the centre, likely holds a caller class). Primary source is the reverse index —
+ * exact file set, no comment-mention noise (tree-sitter refs are real AST nodes),
+ * microseconds. The LSP reference provider remains as the opt-in fallback.
  */
 async function computeCallers(
+  uri: vscode.Uri, uriStr: string, fileText: string, center: FocusedGraphNode
+): Promise<Segment & { refsNonEmpty: boolean }> {
+  const idx = readyIndex();
+  if (idx) {
+    const files = idx.callerFilesOf(simpleName(center.name)).filter(f => f !== uriStr);
+    // A ready index's answer is authoritative — an empty caller set is a real
+    // "nobody calls this" (refsNonEmpty=true marks the result trustworthy for
+    // caching). Only an empty answer with the fallback enabled re-checks via LSP.
+    if (files.length || !lspFallbackEnabled()) {
+      return callersFromFiles(files, center, true);
+    }
+  }
+  return computeCallersLsp(uri, uriStr, fileText, center);
+}
+
+async function computeCallersLsp(
   uri: vscode.Uri, uriStr: string, fileText: string, center: FocusedGraphNode
 ): Promise<Segment & { refsNonEmpty: boolean }> {
   const namePos = findNamePosition(fileText, center.name, center.line);
@@ -237,37 +320,45 @@ async function computeCallers(
     })
   )).filter((u): u is string => u !== null);
 
-  const callerResolutions = await Promise.all(
-    refUriStrings.map(async (callerUriStr) => {
-      const callerParsed = await parseSingleFile(vscode.Uri.parse(callerUriStr));
-      const callerType = callerParsed.find(p => !p.tags?.includes('test'));
-      return callerType ? { type: callerType, uri: callerUriStr } : null;
-    })
-  );
-
-  const nodes: FocusedGraphNode[] = [];
-  const edges: FocusedGraphEdge[] = [];
-  const seen = new Set<string>();
-  for (const res of callerResolutions) {
-    if (!res) { continue; }
-    const id = nodeId(res.uri, res.type.line);
-    if (seen.has(id) || id === center.id) { continue; }
-    seen.add(id);
-    nodes.push(toNode(res.type, res.uri, 'caller'));
-    edges.push({ from: id, to: center.id, kind: 'calls' });
-  }
-  return { nodes, edges, refsNonEmpty };
+  return callersFromFiles(refUriStrings, center, refsNonEmpty);
 }
 
 /**
  * Extrinsic: sibling implementations of the centre's parent class (no edges — they
  * are loose context, shown dimmed/inactive since they don't connect to the centre).
- * Empty when the centre has no resolved `extends`.
+ * Empty when the centre has no resolved `extends`. Index path: every file that
+ * mentions the parent, filtered by an actual extends/implements of it — the same
+ * answer the LSP implementation provider gives, without the server.
  */
 async function computeSiblings(
   uriStr: string, parent: ParentRef | null, center: FocusedGraphNode
 ): Promise<Segment> {
   if (!parent) { return { nodes: [], edges: [] }; }
+  const idx = readyIndex();
+  if (idx) {
+    const parentName = simpleName(parent.name);
+    const candidates = idx.callerFilesOf(parentName)
+      .filter(f => f !== uriStr && f !== parent.uri);
+    const nodes: FocusedGraphNode[] = [];
+    const seen = new Set<string>();
+    for (const sibUriStr of candidates) {
+      const sibParsed = await parseSingleFile(vscode.Uri.parse(sibUriStr));
+      const sibType = sibParsed.find(p => !p.tags?.includes('test')
+        && (p.extendsNames.includes(parentName) || p.implementsNames.includes(parentName)));
+      if (!sibType) { continue; }
+      const id = nodeId(sibUriStr, sibType.line);
+      if (seen.has(id) || id === center.id) { continue; }
+      seen.add(id);
+      nodes.push(toNode(sibType, sibUriStr, 'sibling'));
+    }
+    return { nodes, edges: [] };
+  }
+  return computeSiblingsLsp(uriStr, parent, center);
+}
+
+async function computeSiblingsLsp(
+  uriStr: string, parent: ParentRef, center: FocusedGraphNode
+): Promise<Segment> {
   const parentUri = vscode.Uri.parse(parent.uri);
   let parentText: string;
   try { parentText = await readFileText(parentUri); } catch { return { nodes: [], edges: [] }; }
@@ -374,19 +465,23 @@ export async function buildFocusedGraph(
   }
 
   // ── Readiness verdict: should this be cached? ───────────────────────────────
-  // A neighbourhood resolved before the language server finished indexing would have
-  // wrongly-empty deps/callers; cached, that emptiness would stick (replayed on every
-  // re-select) until a save invalidates it, and the host would keep showing the loading
-  // screen. So cache only once the server is provably ready. Crucially, "empty" is NOT
-  // "not ready": an API controller legitimately has zero callers. We therefore decide
-  // from positive evidence, preferring cheap local signals and only probing the index as
-  // a last resort (so a warm build never pays for it):
+  // With the project index ready, every lookup above was deterministic — empty
+  // answers are genuine (an API controller nobody calls), so the expansion is
+  // always safe to cache. The evidence dance below only applies on the LSP
+  // fallback path, where a neighbourhood resolved before the language server
+  // finished indexing would have wrongly-empty deps/callers; cached, that
+  // emptiness would stick until a save invalidates it. Crucially, "empty" is NOT
+  // "not ready" — so the LSP path decides from positive evidence, probing the
+  // server's symbol index only as a last resort:
   //   • a half that came from cache is already trustworthy;
   //   • any resolved dep proves the symbol index is up (so callers are too — that
   //     subsystem comes up no later);
   //   • any returned reference proves the reference provider is up;
-  //   • a class that declares no deps has genuinely-empty deps, not a stalled index;
-  //   • otherwise the emptiness is ambiguous — fall back to the index probe.
+  //   • a class that declares no deps has genuinely-empty deps, not a stalled index.
+  if (readyIndex()) {
+    setExpansion(uriStr, { ownHash, epoch, center, deps, parent, callers, siblings });
+    return;
+  }
   let indexedMemo: boolean | undefined;
   const indexed = async () => indexedMemo ??= await languageServerIndexed(center.name);
   const depsResolved = deps.nodes.length > 0;

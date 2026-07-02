@@ -29,6 +29,11 @@ export interface LanguageProvider {
   // One-time async grammar load. Must be awaited before parse().
   init(): Promise<void>;
   parse(text: string, uri: string): ParsedType[];
+  // File-level type-name references, for the project reverse index. Unlike the
+  // per-declaration `fieldTypes`, this covers the whole file (module-level code,
+  // free functions), so a file that mentions class X anywhere counts as a caller.
+  // Optional: when absent the index derives refs from parse() output.
+  refNames?(text: string, uri: string): string[];
 }
 
 const providers: LanguageProvider[] = [];

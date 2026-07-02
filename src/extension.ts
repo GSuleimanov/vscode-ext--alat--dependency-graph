@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { GraphSideView } from './commands/graphView';
 import { initProviders } from './graph/lang';
+import { initProjectIndex } from './graph/data/indexService';
 
 export function activate(context: vscode.ExtensionContext): void {
   const graphView = new GraphSideView(context);
@@ -10,6 +11,14 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   void signalLanguageReadiness(graphView);
+
+  // Kick the project index (tree-sitter reverse index — the graph's data source
+  // for callers/deps/siblings). Chunked background build; the graph awaits
+  // readiness instead of polling any language server.
+  void initProjectIndex(context, {
+    onProgress: (indexed, total) => graphView.postIndexProgress(indexed, total),
+    onStats: (stats) => graphView.postIndexStats(stats),
+  });
 }
 
 /**

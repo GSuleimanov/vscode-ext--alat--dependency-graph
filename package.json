@@ -65,6 +65,11 @@
           "minimum": 6,
           "maximum": 32,
           "markdownDescription": "Font size (in px) of node labels."
+        },
+        "alat.lspFallback": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Fall back to the language server (workspace symbols / reference provider) when the built-in project index misses a lookup. Slower but can disambiguate unusual setups. Default: index-only."
         }
       }
     }

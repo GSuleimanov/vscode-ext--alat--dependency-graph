@@ -122,6 +122,27 @@ export function makeProvider(spec: LangSpec): LanguageProvider {
     return applyRules(results, spec.rules ?? [], ctx);
   }
 
+  // Whole-file type references for the reverse index. Deliberately does NOT
+  // require an enclosing declaration (unlike parse()'s per-decl attribution), so
+  // module-level code — free functions, top-level instantiations — still makes
+  // this file a caller of the types it mentions. The file's own declared names
+  // are dropped: a self-reference can't make a file its own caller, and the
+  // declaration patterns double-capture their name node as a broad `uses`.
+  function refNames(text: string, uri: string): string[] {
+    const root = newParser(spec.id).parse(text).rootNode;
+    const ownNames = new Set<string>();
+    const refs = new Set<string>();
+    for (const m of query!.matches(root)) {
+      for (const c of m.captures) {
+        if (c.name === 'name') { ownNames.add(c.node.text); }
+        else if (c.name === 'uses' || c.name === 'extends' || c.name === 'implements') {
+          refs.add(simpleTypeName(c.node));
+        }
+      }
+    }
+    return [...refs].filter(t => !ownNames.has(t) && !(spec.builtins?.has(t)));
+  }
+
   return {
     id: spec.id,
     extensions: spec.extensions,
@@ -132,6 +153,7 @@ export function makeProvider(spec: LangSpec): LanguageProvider {
       query ??= compileQuery(spec.id, spec.query);
     },
     parse,
+    refNames,
   };
 }
 

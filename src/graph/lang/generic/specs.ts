@@ -76,6 +76,9 @@ export const goSpec: LangSpec = {
     (field_declaration type: (qualified_type name: (type_identifier) @uses))
     (field_declaration type: (pointer_type (type_identifier) @uses))
     (field_declaration type: (pointer_type (qualified_type name: (type_identifier) @uses)))
+    (composite_literal type: (type_identifier) @uses)
+    (composite_literal type: (qualified_type name: (type_identifier) @uses))
+    ((type_identifier) @uses)
     (package_clause (package_identifier) @package)
   `,
   builtins: new Set([

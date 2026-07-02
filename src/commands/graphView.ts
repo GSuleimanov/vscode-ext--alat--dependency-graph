@@ -3,6 +3,7 @@ import { buildFocusedGraph, expandDependencies } from '../graph/data/focusedGrap
 import { buildTieredGraph } from '../graph/data/tieredGraphBuilder';
 import { FocusedGraphNode, FocusedGraphEdge } from '../graph/data/focusedGraphTypes';
 import { bumpEpoch, invalidateExpansion, hasExpansion } from '../graph/data/expansionCache';
+import { getProjectIndex, whenIndexReady, IndexStatsMessage } from '../graph/data/indexService';
 import { providerForUri } from '../graph/lang/registry';
 
 // Side-effect import: registers all language providers.
@@ -24,6 +25,7 @@ export class GraphSideView {
   private cancelCurrent?: () => void;
   private languageReady = false;
   private buildSeq = 0;
+  private lastIndexStats?: IndexStatsMessage;
 
   constructor(private readonly context: vscode.ExtensionContext) {
     context.subscriptions.push(
@@ -74,6 +76,17 @@ export class GraphSideView {
     if (ready) { this.postActiveFile(); }
   }
 
+  /** Cold-index progress → the webview loading screen ("Indexing N / M files"). */
+  postIndexProgress(indexed: number, total: number): void {
+    this.panel?.webview.postMessage({ command: 'indexProgress', indexed, total });
+  }
+
+  /** Index footprint → the status bar's right-aligned span. */
+  postIndexStats(stats: IndexStatsMessage): void {
+    this.lastIndexStats = stats;
+    this.panel?.webview.postMessage({ command: 'indexStats', ...stats });
+  }
+
   private postActiveFile(uriOverride?: vscode.Uri): void {
     if (!this.panel) { return; }
     const uri = uriOverride ?? vscode.window.activeTextEditor?.document.uri;
@@ -105,6 +118,9 @@ export class GraphSideView {
       switch (msg.command) {
         case 'ready':
           panel.webview.postMessage({ command: 'languageReady', ready: this.languageReady });
+          if (this.lastIndexStats) {
+            panel.webview.postMessage({ command: 'indexStats', ...this.lastIndexStats });
+          }
           if (this.languageReady) { this.postActiveFile(); }
           break;
         case 'requestBuild':
@@ -170,6 +186,13 @@ export class GraphSideView {
    */
   private async runTieredBuild(centerUri: vscode.Uri, attempt = 0): Promise<void> {
     if (!this.panel) { return; }
+    // Builds resolve callers/deps from the project index; hold the loading screen
+    // through its one-time cold build (indexProgress streams the file counts).
+    if (!getProjectIndex()?.ready()) {
+      this.panel.webview.postMessage({ command: 'buildLoading', loading: true });
+      await whenIndexReady();
+      if (!this.panel) { return; }
+    }
     this.cancelCurrent?.();
     let cancelled = false;
     this.cancelCurrent = () => { cancelled = true; };
@@ -200,17 +223,13 @@ export class GraphSideView {
     }));
     this.panel.webview.postMessage({ command: 'reconcile', seqId, nodes });
 
-    // Self-heal a premature build. Right after activation the file's language providers
-    // may still be warming up (the symbol index for deps, the reference provider for
-    // callers), so the neighbourhood resolves empty. The builder decides readiness by
-    // comparing what tree-sitter parsed locally (the class's declared dependencies)
-    // against what actually resolved, and only caches once that and the callers are
-    // genuinely ready — so a selected file still absent from the cache means tree-sitter
-    // saw something the providers haven't caught up to yet. Poll every 2s until it
-    // resolves (cold-starting a server can take a while), then stop. A real isolated
-    // class caches immediately and never polls; superseding it with a newer build does
-    // too (the seqId guard). Capped so a genuinely unresolvable file can't poll forever.
-    const incomplete = !model.selectedId || !hasExpansion(centerUri.toString());
+    // Self-heal a premature build — LSP-fallback path only. With the project index
+    // ready every lookup was deterministic and cached, so there is nothing to poll:
+    // an empty result is the real answer. On the fallback path the language server
+    // may still be warming up, so an uncached selection means "not ready yet" —
+    // poll every 2s (capped) until the expansion resolves and caches.
+    const incomplete = (!model.selectedId || !hasExpansion(centerUri.toString()))
+      && !getProjectIndex()?.ready();
     if (incomplete && attempt < 20 && seqId === this.buildSeq) {
       // Still waiting on the language server — keep the loading screen up while we poll.
       this.panel.webview.postMessage({ command: 'buildLoading', loading: true });
@@ -264,8 +283,11 @@ export class GraphSideView {
     #cy { flex: 1; position: relative; min-height: 0; overflow: hidden; }
     canvas { display: block; position: absolute; inset: 0; }
 
-    #status { padding: 4px 12px; font-size: 11px; color: var(--vscode-descriptionForeground);
-              border-top: 1px solid var(--vscode-panel-border); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    #status { display: flex; justify-content: space-between; gap: 12px;
+              padding: 4px 12px; font-size: 11px; color: var(--vscode-descriptionForeground);
+              border-top: 1px solid var(--vscode-panel-border); white-space: nowrap; overflow: hidden; }
+    #statusLeft { overflow: hidden; text-overflow: ellipsis; }
+    #statusRight { flex: 0 0 auto; }
 
     /* Live build progress — a small pill in the bottom-left with a spinner. */
     #progress { z-index: 5; position: absolute; left: 12px; bottom: 12px; display: flex; align-items: center; gap: 8px;
@@ -329,12 +351,13 @@ export class GraphSideView {
     </div>
     <div id="progress"><span class="spinner"></span><span id="progressText"></span></div>
   </div>
-  <div id="status"></div>
+  <div id="status"><span id="statusLeft"></span><span id="statusRight"></span></div>
   <script>
     const vscode = acquireVsCodeApi();
     const canvas         = document.getElementById('canvas');
     const ctx            = canvas.getContext('2d');
-    const statusEl       = document.getElementById('status');
+    const statusLeftEl   = document.getElementById('statusLeft');
+    const statusRightEl  = document.getElementById('statusRight');
     const introEl        = document.getElementById('intro');
     const introMsg       = document.getElementById('introMsg');
     const progressEl     = document.getElementById('progress');
@@ -393,6 +416,7 @@ export class GraphSideView {
       return kind === 'extends' ? 4 : kind === 'implements' ? 3 : kind === 'uses' ? 2 : kind === 'calls' ? 1 : 0;
     }
     let activeId = null;
+    let indexStatsText = '';          // right-aligned status span ("12,480 symbols · 8.3 MB")
     // Authoritative caller/dependency counts per node id, computed by the builder when
     // it expands a node (see tieredGraphBuilder). Sticky across rebuilds, so selecting a
     // node that was previously loaded (e.g. an inactive node) shows its true count at
@@ -1110,10 +1134,11 @@ export class GraphSideView {
         }
         const cal = callers === 1 ? '1 caller' : callers + ' callers';
         const dep = deps === 1 ? '1 dependency' : deps + ' dependencies';
-        statusEl.textContent = focus.name + '  ·  ' + cal + '  ·  ' + dep;
+        statusLeftEl.textContent = focus.name + '  ·  ' + cal + '  ·  ' + dep;
       } else {
-        statusEl.textContent = nodeMap.size + ' classes · ' + edges.length + ' relationships';
+        statusLeftEl.textContent = nodeMap.size + ' classes · ' + edges.length + ' relationships';
       }
+      statusRightEl.textContent = indexStatsText;
     }
 
     // ── focus / build orchestration ────────────────────────────────────────────
@@ -1196,10 +1221,27 @@ export class GraphSideView {
       // While it does, hold the loading screen up; drop it once a real result arrives.
       if (msg.command === 'buildLoading') {
         buildLoadingLock = msg.loading;
-        if (msg.loading) { setIntroMsg('Waiting for the language server…'); showIntro(); }
+        if (msg.loading) { setIntroMsg('Indexing the project…'); showIntro(); }
         else { hideIntro(); }
         return;
       }
+      // Index footprint for the status bar's right span (host posts after each
+      // (re)index / incremental update, and replays the latest on webview 'ready').
+      if (msg.command === 'indexStats') {
+        const mb = msg.bytes >= 1048576 ? (msg.bytes / 1048576).toFixed(1) + ' MB'
+          : Math.max(1, Math.round(msg.bytes / 1024)) + ' KB';
+        indexStatsText = (msg.symbols || 0).toLocaleString() + ' symbols · ' + mb;
+        statusRightEl.textContent = indexStatsText;
+        return;
+      }
+      // Cold-index build progress — narrate it on the loading screen while it shows.
+      if (msg.command === 'indexProgress') {
+        if (introEl && introEl.classList.contains('show')) {
+          setIntroMsg('Indexing ' + msg.indexed.toLocaleString() + ' / ' + msg.total.toLocaleString() + ' files…');
+        }
+        return;
+      }
+
       if (msg.command === 'languageReady') {
         languageReady = msg.ready;
         // Only the genuine wait shows the loading screen: while the language server is

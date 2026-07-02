@@ -94,6 +94,29 @@ export function parsePythonSource(rawSource: string, uri: string): ParsedType[] 
   return applyRules(results, pythonRules, ctx);
 }
 
+/**
+ * Whole-file type references for the reverse index. The Python parse is
+ * hand-rolled (no query) and only reads annotated class-body assignments, so it
+ * misses instantiations (`B()`), bases and annotations in module-level code. This
+ * pass collects every capitalized identifier used anywhere in the module — the
+ * same naming heuristic baseNames/fieldTypes already apply — minus the names this
+ * file itself defines (a self-mention can't make a file its own caller).
+ */
+export function pythonRefNames(rawSource: string, _uri: string): string[] {
+  const root = newParser('python').parse(rawSource).rootNode;
+  const own = new Set<string>();
+  for (const def of root.descendantsOfType(['class_definition', 'function_definition'])) {
+    const name = def.childForFieldName('name');
+    if (name) { own.add(name.text); }
+  }
+  const refs = new Set<string>();
+  for (const id of root.descendantsOfType('identifier')) {
+    const t = id.text;
+    if (/^[A-Z][A-Za-z0-9_]*$/.test(t) && !own.has(t)) { refs.add(t); }
+  }
+  return [...refs];
+}
+
 export const pythonProvider: LanguageProvider = {
   id: 'python',
   extensions: ['.py'],
@@ -101,4 +124,5 @@ export const pythonProvider: LanguageProvider = {
   exclude: '**/{node_modules,.venv,venv,__pycache__,build,dist,.git,site-packages}/**',
   init: () => loadLanguage('python', 'tree-sitter-python.wasm'),
   parse: parsePythonSource,
+  refNames: pythonRefNames,
 };
